@@ -1,0 +1,16 @@
+name: crash-demo
+version: 1
+metadata:
+  description: "Designed to demonstrate crash recovery. Kill duraflow during step 'slow'."
+
+steps:
+  - id: prepare
+    run: "echo 'Preparing...'"
+
+  - id: slow
+    run: "bash -c 'echo \"Starting slow work...\"; sleep 15; echo \"Finished slow work.\";'"
+    depends_on: ["prepare"]
+
+  - id: finalize
+    run: "echo 'Success finalization.'"
+    depends_on: ["slow"]

@@ -34,6 +34,7 @@ func main() {
 	rootCmd.AddCommand(statusCmd())
 	rootCmd.AddCommand(eventsCmd())
 	rootCmd.AddCommand(logsCmd())
+	rootCmd.AddCommand(resumeCmd())
 	rootCmd.AddCommand(versionCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -438,3 +439,154 @@ func formatStepStates(states []*store.StepState, orderedSteps []workflow.StepDef
 		fmt.Printf("  %-20s %-18s %-10s %-25s %s\n", s.StepID, s.Status, attemptStr, completedAtStr, errStr)
 	}
 }
+
+func resumeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "resume [run_id]",
+		Short: "Resume crashed/interrupted workflow runs",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := getStore()
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+
+			var runsToResume []string
+			if len(args) == 1 {
+				runsToResume = append(runsToResume, args[0])
+			} else {
+				incomplete, err := s.GetIncompleteRuns()
+				if err != nil {
+					return fmt.Errorf("failed to fetch incomplete runs: %w", err)
+				}
+				if len(incomplete) == 0 {
+					fmt.Println("No incomplete workflow runs found.")
+					return nil
+				}
+				fmt.Printf("Found %d incomplete run(s) to recover.\n", len(incomplete))
+				for _, r := range incomplete {
+					runsToResume = append(runsToResume, r.RunID)
+				}
+			}
+
+			exec := executor.NewHostExecutor()
+			eng := engine.NewWorkflowEngine(s, exec)
+
+			for idx, runID := range runsToResume {
+				run, err := s.GetRun(runID)
+				if err != nil {
+					return fmt.Errorf("failed to fetch run details for %s: %w", runID, err)
+				}
+				if run == nil {
+					return fmt.Errorf("workflow run not found: %s", runID)
+				}
+
+				yamlContent, err := s.GetWorkflowYAML(run.WorkflowName, run.WorkflowVersion)
+				if err != nil {
+					return fmt.Errorf("failed to fetch definition for %s: %w", runID, err)
+				}
+
+				def, _, orderedSteps, err := workflow.ParseAndValidate([]byte(yamlContent))
+				if err != nil {
+					return fmt.Errorf("failed to parse definition for %s: %w", runID, err)
+				}
+
+				fmt.Printf("\n[%d/%d] Resuming workflow run %s (%s)...\n", idx+1, len(runsToResume), runID, def.Name)
+
+				// Print already completed steps
+				states, err := s.GetStepStates(runID)
+				if err == nil {
+					for _, step := range orderedSteps {
+						for _, st := range states {
+							if st.StepID == step.ID && st.Status == engine.StepSucceeded {
+								fmt.Printf("  [%s]    already SUCCEEDED (skipped)\n", step.ID)
+							}
+						}
+					}
+				}
+
+				resumedSteps := make(map[string]bool)
+				var attemptStart time.Time
+
+				eng.OnEvent = func(ev *store.Event) {
+					if ev.RunID != runID {
+						return
+					}
+					switch ev.EventType {
+					case engine.EventStepResumed:
+						resumedSteps[ev.StepID] = true
+						fmt.Printf("  [%s]    resuming ", ev.StepID)
+					
+					case engine.EventStepStarted:
+						maxAttempts := 1
+						for _, st := range orderedSteps {
+							if st.ID == ev.StepID {
+								if st.Retry != nil && st.Retry.MaxAttempts > 0 {
+									maxAttempts = st.Retry.MaxAttempts
+								}
+								break
+							}
+						}
+						attemptStart = time.Now()
+						if resumedSteps[ev.StepID] {
+							fmt.Printf("attempt %d/%d ... ", ev.Attempt, maxAttempts)
+							resumedSteps[ev.StepID] = false
+						} else {
+							fmt.Printf("  [%s]    attempt %d/%d ... ", ev.StepID, ev.Attempt, maxAttempts)
+						}
+
+					case engine.EventStepSucceeded:
+						dur := time.Since(attemptStart).Round(time.Millisecond)
+						fmt.Printf("SUCCEEDED (%v)\n", dur)
+
+					case engine.EventStepRetryScheduled:
+						delayMs := int64(0)
+						if ev.PayloadJSON != "" {
+							var p struct {
+								DelayMs int64 `json:"delay_ms"`
+							}
+							_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
+							delayMs = p.DelayMs
+						}
+						delayStr := fmt.Sprintf("%v", time.Duration(delayMs)*time.Millisecond)
+						fmt.Printf("FAILED [retry in %s]\n", delayStr)
+
+					case engine.EventStepFailedFinal:
+						errStr := "failed"
+						if ev.PayloadJSON != "" {
+							var p struct {
+								Error string `json:"error"`
+							}
+							_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
+							if p.Error != "" {
+								errStr = p.Error
+							}
+						}
+						fmt.Printf("FAILED (%s)\n", errStr)
+					}
+				}
+
+				err = eng.ResumeWorkflow(context.Background(), runID)
+				if err != nil {
+					fmt.Printf("Error resuming run %s: %v\n", runID, err)
+					continue
+				}
+
+				// Fetch updated details
+				updatedRun, err := s.GetRun(runID)
+				if err == nil {
+					fmt.Printf("\nStatus:  %s\n", updatedRun.Status)
+					updatedStates, err := s.GetStepStates(runID)
+					if err == nil {
+						fmt.Println("\nSteps:")
+						formatStepStates(updatedStates, orderedSteps)
+					}
+				}
+			}
+
+			return nil
+		},
+	}
+}
+

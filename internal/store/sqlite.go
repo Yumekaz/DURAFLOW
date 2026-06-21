@@ -318,3 +318,57 @@ func (s *SQLiteStore) GetLogs(runID string, stepID string) ([]*LogEntry, error) 
 	}
 	return entries, nil
 }
+
+func (s *SQLiteStore) GetWorkflowYAML(name string, version int) (string, error) {
+	query := `
+		SELECT definition_yaml FROM workflow_definitions
+		WHERE name = ? AND version = ?;
+	`
+	var yamlContent string
+	err := s.db.QueryRow(query, name, version).Scan(&yamlContent)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("workflow definition not found: %s v%d", name, version)
+	} else if err != nil {
+		return "", fmt.Errorf("failed to fetch workflow definition: %w", err)
+	}
+	return yamlContent, nil
+}
+
+func (s *SQLiteStore) GetIncompleteRuns() ([]*WorkflowRun, error) {
+	query := `
+		SELECT run_id, workflow_name, workflow_version, status, created_at, started_at, completed_at, failed_at, metadata_json
+		FROM workflow_runs
+		WHERE status = 'RUNNING' OR status = 'CREATED'
+		ORDER BY created_at ASC;
+	`
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query incomplete runs: %w", err)
+	}
+	defer rows.Close()
+
+	var runs []*WorkflowRun
+	for rows.Next() {
+		var r WorkflowRun
+		var startedAt, completedAt, failedAt sql.NullString
+		err := rows.Scan(
+			&r.RunID, &r.WorkflowName, &r.WorkflowVersion, &r.Status,
+			&r.CreatedAt, &startedAt, &completedAt, &failedAt, &r.MetadataJSON,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan workflow run: %w", err)
+		}
+		if startedAt.Valid {
+			r.StartedAt = startedAt.String
+		}
+		if completedAt.Valid {
+			r.CompletedAt = completedAt.String
+		}
+		if failedAt.Valid {
+			r.FailedAt = failedAt.String
+		}
+		runs = append(runs, &r)
+	}
+	return runs, nil
+}
+

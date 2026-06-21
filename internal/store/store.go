@@ -58,12 +58,14 @@ type EventStore interface {
 	// Workflow definitions
 	RegisterWorkflow(def *workflow.WorkflowDef, hash string, yamlContent string) error
 	GetWorkflowDef(name string, version int) (*workflow.WorkflowDef, error)
+	GetWorkflowYAML(name string, version int) (string, error)
 
 	// Workflow runs
 	CreateRun(run *WorkflowRun) error
 	UpdateRunStatus(runID string, status string, timestamps map[string]string) error
 	GetRun(runID string) (*WorkflowRun, error)
 	ListRuns(limit int) ([]*WorkflowRun, error)
+	GetIncompleteRuns() ([]*WorkflowRun, error)
 
 	// Events (append-only)
 	AppendEvent(event *Event) error

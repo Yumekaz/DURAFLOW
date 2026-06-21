@@ -32,4 +32,6 @@ const (
 	EventStepRetryScheduled = "StepRetryScheduled"
 	EventStepTimedOut       = "StepTimedOut"
 	EventStepFailedFinal    = "StepFailedFinal"
+	EventWorkflowResumed    = "WorkflowResumed"
+	EventStepResumed        = "StepResumed"
 )

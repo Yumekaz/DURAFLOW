@@ -628,3 +628,251 @@ steps:
 		t.Errorf("expected attempt 1 (no retries), got %d", st.Attempt)
 	}
 }
+
+func TestResume_CrashedStepRunning(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "duraflow-engine-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "duraflow.db")
+	dbStore := store.NewSQLiteStore(dbPath)
+	if err := dbStore.Init(); err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer dbStore.Close()
+
+	hostExec := executor.NewHostExecutor()
+	eng := NewWorkflowEngine(dbStore, hostExec)
+
+	yamlContent := `
+name: test-resume-running
+version: 1
+steps:
+  - id: step-1
+    run: "echo 'step 1'"
+  - id: step-2
+    run: "echo 'step 2'"
+    depends_on: ["step-1"]
+`
+	def, hash, _, err := workflow.ParseAndValidate([]byte(yamlContent))
+	if err != nil {
+		t.Fatalf("failed to parse workflow: %v", err)
+	}
+
+	// Manually register definition, create run in RUNNING state
+	err = dbStore.RegisterWorkflow(def, hash, yamlContent)
+	if err != nil {
+		t.Fatalf("failed to register definition: %v", err)
+	}
+
+	runID := "test-run-running"
+	run := &store.WorkflowRun{
+		RunID:           runID,
+		WorkflowName:    def.Name,
+		WorkflowVersion: def.Version,
+		Status:          StatusRunning,
+		CreatedAt:       "2026-06-21T00:00:00Z",
+	}
+	err = dbStore.CreateRun(run)
+	if err != nil {
+		t.Fatalf("failed to create run: %v", err)
+	}
+
+	// Manually write step states:
+	// step-1 is already SUCCEEDED.
+	// step-2 was RUNNING (crashed during attempt 1).
+	err = dbStore.UpsertStepState(&store.StepState{
+		RunID:       runID,
+		StepID:      "step-1",
+		Status:      StepSucceeded,
+		Attempt:     1,
+		MaxAttempts: 1,
+	})
+	if err != nil {
+		t.Fatalf("failed to save step-1 state: %v", err)
+	}
+
+	err = dbStore.UpsertStepState(&store.StepState{
+		RunID:       runID,
+		StepID:      "step-2",
+		Status:      StepRunning,
+		Attempt:     1,
+		MaxAttempts: 2,
+	})
+	if err != nil {
+		t.Fatalf("failed to save step-2 state: %v", err)
+	}
+
+	// Resume the workflow
+	err = eng.ResumeWorkflow(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("failed to resume workflow: %v", err)
+	}
+
+	// Verify run record is COMPLETED
+	run, err = dbStore.GetRun(runID)
+	if err != nil {
+		t.Fatalf("failed to get run: %v", err)
+	}
+	if run.Status != StatusCompleted {
+		t.Errorf("expected run status COMPLETED, got %q", run.Status)
+	}
+
+	// Verify step states: step-2 is now SUCCEEDED
+	states, err := dbStore.GetStepStates(runID)
+	if err != nil {
+		t.Fatalf("failed to get step states: %v", err)
+	}
+	for _, st := range states {
+		if st.Status != StepSucceeded {
+			t.Errorf("expected step %s status to be SUCCEEDED, got %s", st.StepID, st.Status)
+		}
+		if st.StepID == "step-2" && st.Attempt != 1 {
+			t.Errorf("expected step-2 attempt to remain 1 (re-run of interrupted attempt), got %d", st.Attempt)
+		}
+	}
+
+	// Verify events include EventWorkflowResumed and EventStepResumed
+	events, err := dbStore.GetEvents(runID)
+	if err != nil {
+		t.Fatalf("failed to get events: %v", err)
+	}
+	hasResumedRunEvent := false
+	hasResumedStepEvent := false
+	for _, ev := range events {
+		if ev.EventType == EventWorkflowResumed {
+			hasResumedRunEvent = true
+		}
+		if ev.EventType == EventStepResumed && ev.StepID == "step-2" {
+			hasResumedStepEvent = true
+		}
+	}
+	if !hasResumedRunEvent {
+		t.Errorf("expected EventWorkflowResumed event, not found")
+	}
+	if !hasResumedStepEvent {
+		t.Errorf("expected EventStepResumed event for step-2, not found")
+	}
+}
+
+func TestResume_CrashedStepRetryScheduled(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "duraflow-engine-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "duraflow.db")
+	dbStore := store.NewSQLiteStore(dbPath)
+	if err := dbStore.Init(); err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer dbStore.Close()
+
+	hostExec := executor.NewHostExecutor()
+	eng := NewWorkflowEngine(dbStore, hostExec)
+
+	yamlContent := `
+name: test-resume-retry
+version: 1
+steps:
+  - id: step-1
+    run: "echo 'step 1'"
+    retry:
+      max_attempts: 2
+`
+	def, hash, _, err := workflow.ParseAndValidate([]byte(yamlContent))
+	if err != nil {
+		t.Fatalf("failed to parse workflow: %v", err)
+	}
+
+	err = dbStore.RegisterWorkflow(def, hash, yamlContent)
+	if err != nil {
+		t.Fatalf("failed to register definition: %v", err)
+	}
+
+	runID := "test-run-retry"
+	run := &store.WorkflowRun{
+		RunID:           runID,
+		WorkflowName:    def.Name,
+		WorkflowVersion: def.Version,
+		Status:          StatusRunning,
+		CreatedAt:       "2026-06-21T00:00:00Z",
+	}
+	err = dbStore.CreateRun(run)
+	if err != nil {
+		t.Fatalf("failed to create run: %v", err)
+	}
+
+	// step-1 was RETRY_SCHEDULED (crashed while waiting to retry attempt 2)
+	err = dbStore.UpsertStepState(&store.StepState{
+		RunID:       runID,
+		StepID:      "step-1",
+		Status:      StepRetryScheduled,
+		Attempt:     1,
+		MaxAttempts: 2,
+	})
+	if err != nil {
+		t.Fatalf("failed to save step-1 state: %v", err)
+	}
+
+	err = eng.ResumeWorkflow(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("failed to resume workflow: %v", err)
+	}
+
+	// Verify step states: step-1 is now SUCCEEDED, and attempt is 2
+	states, err := dbStore.GetStepStates(runID)
+	if err != nil {
+		t.Fatalf("failed to get step states: %v", err)
+	}
+	if len(states) != 1 {
+		t.Fatalf("expected 1 step state, got %d", len(states))
+	}
+	st := states[0]
+	if st.Status != StepSucceeded {
+		t.Errorf("expected step-1 status SUCCEEDED, got %s", st.Status)
+	}
+	if st.Attempt != 2 {
+		t.Errorf("expected step-1 attempt to proceed to 2, got %d", st.Attempt)
+	}
+}
+
+func TestResume_CompletedRuns(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "duraflow-engine-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "duraflow.db")
+	dbStore := store.NewSQLiteStore(dbPath)
+	if err := dbStore.Init(); err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer dbStore.Close()
+
+	hostExec := executor.NewHostExecutor()
+	eng := NewWorkflowEngine(dbStore, hostExec)
+
+	runID := "test-completed"
+	run := &store.WorkflowRun{
+		RunID:           runID,
+		WorkflowName:    "test-workflow",
+		WorkflowVersion: 1,
+		Status:          StatusCompleted,
+		CreatedAt:       "2026-06-21T00:00:00Z",
+	}
+	err = dbStore.CreateRun(run)
+	if err != nil {
+		t.Fatalf("failed to create run: %v", err)
+	}
+
+	err = eng.ResumeWorkflow(context.Background(), runID)
+	if err == nil {
+		t.Errorf("expected error when resuming completed workflow run, got nil")
+	}
+}
+

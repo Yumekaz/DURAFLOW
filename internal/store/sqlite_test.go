@@ -156,4 +156,36 @@ steps:
 	if len(logs) != 1 || logs[0].Content != "hello output" || logs[0].Stream != "stdout" {
 		t.Errorf("expected 1 log entry with content 'hello output', got %+v", logs)
 	}
+
+	// 6. Test GetWorkflowYAML
+	yamlContentFetched, err := store.GetWorkflowYAML("test-workflow", 1)
+	if err != nil {
+		t.Fatalf("failed to get workflow YAML: %v", err)
+	}
+	if yamlContentFetched != yamlContent {
+		t.Errorf("expected workflow YAML %q, got %q", yamlContent, yamlContentFetched)
+	}
+
+	// 7. Test GetIncompleteRuns
+	incomplete, err := store.GetIncompleteRuns()
+	if err != nil {
+		t.Fatalf("failed to get incomplete runs: %v", err)
+	}
+	if len(incomplete) != 1 || incomplete[0].RunID != "run-1" {
+		t.Errorf("expected 1 incomplete run with ID 'run-1', got: %+v", incomplete)
+	}
+
+	// Change run-1 to COMPLETED and verify incomplete is empty
+	err = store.UpdateRunStatus("run-1", "COMPLETED", nil)
+	if err != nil {
+		t.Fatalf("failed to update status: %v", err)
+	}
+	incomplete, err = store.GetIncompleteRuns()
+	if err != nil {
+		t.Fatalf("failed to get incomplete runs: %v", err)
+	}
+	if len(incomplete) != 0 {
+		t.Errorf("expected 0 incomplete runs, got: %+v", incomplete)
+	}
 }
+
