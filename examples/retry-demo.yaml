@@ -1,0 +1,22 @@
+name: retry-demo
+version: 1
+metadata:
+  description: "Demonstrates retry with exponential backoff. Step 'flaky' fails randomly."
+
+steps:
+  - id: setup
+    run: "echo 'Setting up...'"
+
+  - id: flaky
+    run: "bash -c 'if [ $((RANDOM % 3)) -eq 0 ]; then echo ok; else echo fail >&2; exit 1; fi'"
+    depends_on: ["setup"]
+    timeout_ms: 5000
+    retry:
+      max_attempts: 5
+      backoff: exponential
+      initial_delay_ms: 500
+      max_delay_ms: 4000
+
+  - id: cleanup
+    run: "echo 'Done.'"
+    depends_on: ["flaky"]

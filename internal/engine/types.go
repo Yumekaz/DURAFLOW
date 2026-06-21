@@ -10,10 +10,13 @@ const (
 
 // Step statuses
 const (
-	StepPending   = "PENDING"
-	StepRunning   = "RUNNING"
-	StepSucceeded = "SUCCEEDED"
-	StepFailed    = "FAILED"
+	StepPending        = "PENDING"
+	StepRunning        = "RUNNING"
+	StepSucceeded      = "SUCCEEDED"
+	StepFailed         = "FAILED" // Legacy / simple failed status
+	StepRetryScheduled = "RETRY_SCHEDULED"
+	StepTimedOut       = "TIMED_OUT"
+	StepFailedFinal    = "FAILED_FINAL"
 )
 
 // Event types
@@ -26,4 +29,7 @@ const (
 	EventStepStarted        = "StepStarted"
 	EventStepSucceeded      = "StepSucceeded"
 	EventStepFailed         = "StepAttemptFailed"
+	EventStepRetryScheduled = "StepRetryScheduled"
+	EventStepTimedOut       = "StepTimedOut"
+	EventStepFailedFinal    = "StepFailedFinal"
 )

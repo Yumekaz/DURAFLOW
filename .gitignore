@@ -1,6 +1,6 @@
 # Binaries
 bin/
-duraflow
+/duraflow
 
 # SQLite databases
 *.db

@@ -29,7 +29,7 @@ func ParseAndValidate(data []byte) (*WorkflowDef, string, []StepDef, error) {
 
 	// 3. Validate step uniqueness and non-emptiness
 	stepMap := make(map[string]StepDef)
-	for _, step := range def.Steps {
+	for i, step := range def.Steps {
 		if step.ID == "" {
 			return nil, "", nil, fmt.Errorf("step ID cannot be empty")
 		}
@@ -49,6 +49,7 @@ func ParseAndValidate(data []byte) (*WorkflowDef, string, []StepDef, error) {
 				step.Retry.Backoff = "fixed"
 			}
 		}
+		def.Steps[i] = step
 		stepMap[step.ID] = step
 	}
 

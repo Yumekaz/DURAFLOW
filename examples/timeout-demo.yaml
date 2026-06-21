@@ -1,0 +1,13 @@
+name: timeout-demo
+version: 1
+steps:
+  - id: fast
+    run: "echo 'fast step'"
+  - id: slow
+    run: "sleep 10"
+    depends_on: ["fast"]
+    timeout_ms: 2000
+    retry:
+      max_attempts: 2
+      backoff: fixed
+      delay_ms: 1000

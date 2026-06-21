@@ -20,11 +20,13 @@ type StepDef struct {
 }
 
 type RetryPolicy struct {
-	MaxAttempts    int    `yaml:"max_attempts"`
-	Backoff        string `yaml:"backoff"` // "fixed" | "exponential"
-	InitialDelayMs int64  `yaml:"initial_delay_ms"`
-	MaxDelayMs     int64  `yaml:"max_delay_ms"`
-	DelayMs        int64  `yaml:"delay_ms"` // for fixed backoff
+	MaxAttempts        int    `yaml:"max_attempts"`
+	Backoff            string `yaml:"backoff"` // "fixed" | "exponential"
+	InitialDelayMs     int64  `yaml:"initial_delay_ms"`
+	MaxDelayMs         int64  `yaml:"max_delay_ms"`
+	DelayMs            int64  `yaml:"delay_ms"` // for fixed backoff
+	RetryOnExitCodes   []int  `yaml:"retry_on_exit_codes"`
+	NoRetryOnExitCodes []int  `yaml:"no_retry_on_exit_codes"`
 }
 
 type OnFailureDef struct {
