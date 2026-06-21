@@ -1,0 +1,23 @@
+name: backup-db
+version: 1
+metadata:
+  owner: "platform"
+  description: "A database backup pipeline: creates snapshot, compresses it, verifies checksum."
+env:
+  BACKUP_DIR: "/tmp/duraflow-backups"
+  DB_FILE: "app.db"
+steps:
+  - id: prepare
+    run: "mkdir -p $BACKUP_DIR && touch $DB_FILE && echo 'mock database data' > $DB_FILE"
+
+  - id: dump
+    run: "cp $DB_FILE $BACKUP_DIR/backup.db"
+    depends_on: ["prepare"]
+
+  - id: compress
+    run: "gzip -f $BACKUP_DIR/backup.db"
+    depends_on: ["dump"]
+
+  - id: verify
+    run: "sha256sum $BACKUP_DIR/backup.db.gz"
+    depends_on: ["compress"]

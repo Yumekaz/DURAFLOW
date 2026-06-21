@@ -1,0 +1,19 @@
+# Binaries
+bin/
+duraflow
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.duraflow/
+
+# Test binary outputs
+*.test
+*.out
+
+# OS/IDE artifacts
+.idea/
+.vscode/
+.DS_Store

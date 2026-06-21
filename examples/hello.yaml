@@ -1,0 +1,10 @@
+name: hello
+version: 1
+metadata:
+  description: "Minimal hello world workflow demonstrating sequential execution."
+steps:
+  - id: greet
+    run: "echo 'Hello from DuraFlow!'"
+  - id: timestamp
+    run: "date -u '+%Y-%m-%dT%H:%M:%SZ'"
+    depends_on: ["greet"]
