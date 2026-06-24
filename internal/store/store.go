@@ -1,6 +1,8 @@
 package store
 
 import (
+	"time"
+
 	"github.com/yumekaz/duraflow/internal/workflow"
 )
 
@@ -51,6 +53,23 @@ type LogEntry struct {
 	CreatedAt string
 }
 
+type Worker struct {
+	WorkerID        string
+	Hostname        string
+	PID             int
+	StartedAt       string
+	LastHeartbeatAt string
+	Status          string
+}
+
+type Lease struct {
+	RunID     string
+	StepID    string
+	WorkerID  string
+	ExpiresAt string
+	Status    string
+}
+
 type EventStore interface {
 	Init() error
 	Close() error
@@ -78,4 +97,14 @@ type EventStore interface {
 	// Logs
 	AppendLog(entry *LogEntry) error
 	GetLogs(runID string, stepID string) ([]*LogEntry, error)
+
+	// Workers
+	RegisterWorker(w *Worker) error
+	HeartbeatWorker(workerID string) error
+	GetActiveWorkers() ([]*Worker, error)
+
+	// Leases
+	AcquireLease(runID, stepID, workerID string, duration time.Duration) (bool, error)
+	RenewLease(runID, stepID, workerID string, duration time.Duration) (bool, error)
+	ReleaseLease(runID, stepID, workerID string) error
 }

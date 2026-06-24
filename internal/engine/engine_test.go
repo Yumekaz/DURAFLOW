@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yumekaz/duraflow/internal/executor"
 	"github.com/yumekaz/duraflow/internal/store"
@@ -51,6 +52,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	// Verify run record
 	run, err := dbStore.GetRun(runID)
@@ -154,6 +156,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	// Verify run record shows failed
 	run, err := dbStore.GetRun(runID)
@@ -244,6 +247,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	run, err := dbStore.GetRun(runID)
 	if err != nil {
@@ -333,6 +337,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	run, err := dbStore.GetRun(runID)
 	if err != nil {
@@ -421,6 +426,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	events, err := dbStore.GetEvents(runID)
 	if err != nil {
@@ -488,6 +494,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	run, err := dbStore.GetRun(runID)
 	if err != nil {
@@ -563,6 +570,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	states, err := dbStore.GetStepStates(runID)
 	if err != nil {
@@ -615,6 +623,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	states, err := dbStore.GetStepStates(runID)
 	if err != nil {
@@ -710,6 +719,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to resume workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	// Verify run record is COMPLETED
 	run, err = dbStore.GetRun(runID)
@@ -822,6 +832,7 @@ steps:
 	if err != nil {
 		t.Fatalf("failed to resume workflow: %v", err)
 	}
+	runTestWorker(t, dbStore, eng, runID)
 
 	// Verify step states: step-1 is now SUCCEEDED, and attempt is 2
 	states, err := dbStore.GetStepStates(runID)
@@ -875,4 +886,118 @@ func TestResume_CompletedRuns(t *testing.T) {
 		t.Errorf("expected error when resuming completed workflow run, got nil")
 	}
 }
+
+func runTestWorker(t *testing.T, dbStore store.EventStore, eng *WorkflowEngine, runID string) {
+	err := dbStore.RegisterWorker(&store.Worker{
+		WorkerID:        "test-worker",
+		Hostname:        "localhost",
+		PID:             os.Getpid(),
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		LastHeartbeatAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Status:          "ACTIVE",
+	})
+	if err != nil {
+		t.Fatalf("failed to register test worker: %v", err)
+	}
+
+	for i := 0; i < 500; i++ {
+		run, err := dbStore.GetRun(runID)
+		if err != nil {
+			t.Fatalf("failed to get run: %v", err)
+		}
+		if run.Status == StatusCompleted || run.Status == StatusFailed {
+			return
+		}
+
+		yamlContent, err := dbStore.GetWorkflowYAML(run.WorkflowName, run.WorkflowVersion)
+		if err != nil {
+			t.Fatalf("failed to get workflow YAML: %v", err)
+		}
+
+		def, _, orderedSteps, err := workflow.ParseAndValidate([]byte(yamlContent))
+		if err != nil {
+			t.Fatalf("failed to parse/validate: %v", err)
+		}
+
+		states, err := dbStore.GetStepStates(runID)
+		if err != nil {
+			t.Fatalf("failed to get step states: %v", err)
+		}
+
+		stateMap := make(map[string]*store.StepState)
+		for _, st := range states {
+			stateMap[st.StepID] = st
+		}
+
+		var stepToRun *workflow.StepDef
+		for _, step := range orderedSteps {
+			st := stateMap[step.ID]
+			isEligible := false
+			statusStr := "nil"
+			if st != nil {
+				statusStr = st.Status
+			}
+			if st == nil || st.Status == StepPending || st.Status == StepRunning {
+				isEligible = true
+			} else if st.Status == StepRetryScheduled {
+				nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+				if st.NextRetryAt == "" || st.NextRetryAt <= nowStr {
+					isEligible = true
+				}
+			}
+
+			if isEligible {
+				depsMet := true
+				for _, dep := range step.DependsOn {
+					depState := stateMap[dep]
+					if depState == nil || depState.Status != StepSucceeded {
+						depsMet = false
+						break
+					}
+				}
+				if depsMet {
+					stepToRun = &step
+					break
+				}
+			} else {
+				t.Logf("[test-worker] step %s status is %s (not eligible)", step.ID, statusStr)
+			}
+		}
+
+		if stepToRun != nil {
+			t.Logf("[test-worker] found step to run: %s, attempting to acquire lease...", stepToRun.ID)
+			acquired, err := dbStore.AcquireLease(runID, stepToRun.ID, "test-worker", 5*time.Second)
+			if err != nil {
+				t.Logf("[test-worker] acquire lease error: %v", err)
+			} else if !acquired {
+				t.Logf("[test-worker] lease not acquired for %s", stepToRun.ID)
+			} else {
+				t.Logf("[test-worker] lease acquired for %s, executing step...", stepToRun.ID)
+				updatedStates, _ := dbStore.GetStepStates(runID)
+				attempt := 1
+				for _, us := range updatedStates {
+					if us.StepID == stepToRun.ID {
+						attempt = us.Attempt
+						break
+					}
+				}
+
+				execErr := eng.ExecuteStepAttempt(context.Background(), runID, def, *stepToRun, attempt)
+				t.Logf("[test-worker] execution finished for %s, error: %v", stepToRun.ID, execErr)
+				releaseErr := dbStore.ReleaseLease(runID, stepToRun.ID, "test-worker")
+				if releaseErr != nil {
+					t.Logf("[test-worker] failed to release lease for %s: %v", stepToRun.ID, releaseErr)
+				} else {
+					t.Logf("[test-worker] lease released for %s", stepToRun.ID)
+				}
+			}
+		} else {
+			t.Logf("[test-worker] no step to run found")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for run %s completion", runID)
+}
+
 

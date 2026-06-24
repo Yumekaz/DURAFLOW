@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite"
 	"github.com/yumekaz/duraflow/internal/workflow"
@@ -371,4 +372,200 @@ func (s *SQLiteStore) GetIncompleteRuns() ([]*WorkflowRun, error) {
 	}
 	return runs, nil
 }
+
+func (s *SQLiteStore) RegisterWorker(w *Worker) error {
+	query := `
+		INSERT INTO workers (worker_id, hostname, pid, started_at, last_heartbeat_at, status)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(worker_id) DO UPDATE SET
+			hostname = excluded.hostname,
+			pid = excluded.pid,
+			last_heartbeat_at = excluded.last_heartbeat_at,
+			status = excluded.status;
+	`
+	_, err := s.db.Exec(query, w.WorkerID, w.Hostname, w.PID, w.StartedAt, w.LastHeartbeatAt, w.Status)
+	if err != nil {
+		return fmt.Errorf("failed to register worker: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) HeartbeatWorker(workerID string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	query := `
+		UPDATE workers SET last_heartbeat_at = ?, status = 'ACTIVE'
+		WHERE worker_id = ?;
+	`
+	_, err := s.db.Exec(query, now, workerID)
+	if err != nil {
+		return fmt.Errorf("failed to heartbeat worker: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetActiveWorkers() ([]*Worker, error) {
+	threshold := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339Nano)
+	query := `
+		SELECT worker_id, hostname, pid, started_at, last_heartbeat_at, status
+		FROM workers
+		WHERE status = 'ACTIVE' AND last_heartbeat_at >= ?;
+	`
+	rows, err := s.db.Query(query, threshold)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active workers: %w", err)
+	}
+	defer rows.Close()
+
+	var workers []*Worker
+	for rows.Next() {
+		var w Worker
+		err := rows.Scan(&w.WorkerID, &w.Hostname, &w.PID, &w.StartedAt, &w.LastHeartbeatAt, &w.Status)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan worker: %w", err)
+		}
+		workers = append(workers, &w)
+	}
+	return workers, nil
+}
+
+func (s *SQLiteStore) AcquireLease(runID, stepID, workerID string, duration time.Duration) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	queryLease := `
+		SELECT worker_id, expires_at, status FROM leases
+		WHERE run_id = ? AND step_id = ?;
+	`
+	var currentWorkerID, expiresAt, status string
+	err = tx.QueryRow(queryLease, runID, stepID).Scan(&currentWorkerID, &expiresAt, &status)
+
+	isEligible := false
+	if err == sql.ErrNoRows {
+		isEligible = true
+	} else if err != nil {
+		return false, fmt.Errorf("failed to query lease: %w", err)
+	} else {
+		nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+		if status == "RELEASED" {
+			isEligible = true
+		} else if expiresAt < nowStr {
+			isEligible = true
+		} else {
+			queryWorker := `
+				SELECT last_heartbeat_at, status FROM workers
+				WHERE worker_id = ?;
+			`
+			var lastHeartbeat, workerStatus string
+			err = tx.QueryRow(queryWorker, currentWorkerID).Scan(&lastHeartbeat, &workerStatus)
+			if err == sql.ErrNoRows {
+				isEligible = true
+			} else if err != nil {
+				return false, fmt.Errorf("failed to query owning worker: %w", err)
+			} else {
+				heartbeatTime, parseErr := time.Parse(time.RFC3339Nano, lastHeartbeat)
+				if parseErr != nil || workerStatus != "ACTIVE" || time.Since(heartbeatTime) > 10*time.Second {
+					isEligible = true
+				}
+			}
+		}
+	}
+
+	if !isEligible {
+		return false, nil
+	}
+
+	newExpiresAt := time.Now().Add(duration).UTC().Format(time.RFC3339Nano)
+	queryUpsertLease := `
+		INSERT INTO leases (run_id, step_id, worker_id, expires_at, status)
+		VALUES (?, ?, ?, ?, 'ACTIVE')
+		ON CONFLICT(run_id, step_id) DO UPDATE SET
+			worker_id = excluded.worker_id,
+			expires_at = excluded.expires_at,
+			status = 'ACTIVE';
+	`
+	_, err = tx.Exec(queryUpsertLease, runID, stepID, workerID, newExpiresAt)
+	if err != nil {
+		return false, fmt.Errorf("failed to upsert lease: %w", err)
+	}
+
+	queryStepState := `
+		SELECT status, attempt, max_attempts FROM step_states
+		WHERE run_id = ? AND step_id = ?;
+	`
+	var stepStatus string
+	var attempt, maxAttempts int
+	err = tx.QueryRow(queryStepState, runID, stepID).Scan(&stepStatus, &attempt, &maxAttempts)
+	if err != nil && err != sql.ErrNoRows {
+		return false, fmt.Errorf("failed to query step state: %w", err)
+	}
+
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	nextAttempt := attempt
+	if stepStatus == "PENDING" || stepStatus == "" {
+		nextAttempt = 1
+	} else if stepStatus == "RETRY_SCHEDULED" {
+		nextAttempt = attempt + 1
+	} else if stepStatus == "RUNNING" {
+		if nextAttempt < 1 {
+			nextAttempt = 1
+		}
+	}
+
+	queryUpsertStepState := `
+		INSERT INTO step_states (run_id, step_id, status, attempt, max_attempts, started_at, worker_id)
+		VALUES (?, ?, 'RUNNING', ?, ?, ?, ?)
+		ON CONFLICT(run_id, step_id) DO UPDATE SET
+			status = 'RUNNING',
+			attempt = excluded.attempt,
+			max_attempts = excluded.max_attempts,
+			started_at = excluded.started_at,
+			worker_id = excluded.worker_id;
+	`
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	_, err = tx.Exec(queryUpsertStepState, runID, stepID, nextAttempt, maxAttempts, nowStr, workerID)
+	if err != nil {
+		return false, fmt.Errorf("failed to update step state to running: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return true, nil
+}
+
+func (s *SQLiteStore) RenewLease(runID, stepID, workerID string, duration time.Duration) (bool, error) {
+	expiresAt := time.Now().Add(duration).UTC().Format(time.RFC3339Nano)
+	query := `
+		UPDATE leases SET expires_at = ?
+		WHERE run_id = ? AND step_id = ? AND worker_id = ? AND status = 'ACTIVE';
+	`
+	res, err := s.db.Exec(query, expiresAt, runID, stepID, workerID)
+	if err != nil {
+		return false, fmt.Errorf("failed to renew lease: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (s *SQLiteStore) ReleaseLease(runID, stepID, workerID string) error {
+	query := `
+		UPDATE leases SET status = 'RELEASED'
+		WHERE run_id = ? AND step_id = ? AND worker_id = ? AND status = 'ACTIVE';
+	`
+	_, err := s.db.Exec(query, runID, stepID, workerID)
+	if err != nil {
+		return fmt.Errorf("failed to release lease: %w", err)
+	}
+	return nil
+}
+
 

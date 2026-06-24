@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yumekaz/duraflow/internal/workflow"
 )
@@ -188,4 +189,171 @@ steps:
 		t.Errorf("expected 0 incomplete runs, got: %+v", incomplete)
 	}
 }
+
+func TestSQLiteStore_WorkersAndLeases(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "duraflow-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	store := NewSQLiteStore(dbPath)
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Worker Registration and Heartbeats
+	w1 := &Worker{
+		WorkerID:        "worker-1",
+		Hostname:        "localhost",
+		PID:             1001,
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		LastHeartbeatAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Status:          "ACTIVE",
+	}
+	err = store.RegisterWorker(w1)
+	if err != nil {
+		t.Fatalf("failed to register w1: %v", err)
+	}
+
+	w2 := &Worker{
+		WorkerID:        "worker-2",
+		Hostname:        "localhost",
+		PID:             1002,
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		LastHeartbeatAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Status:          "ACTIVE",
+	}
+	err = store.RegisterWorker(w2)
+	if err != nil {
+		t.Fatalf("failed to register w2: %v", err)
+	}
+
+	active, err := store.GetActiveWorkers()
+	if err != nil {
+		t.Fatalf("failed to get active workers: %v", err)
+	}
+	if len(active) != 2 {
+		t.Errorf("expected 2 active workers, got %d", len(active))
+	}
+
+	err = store.HeartbeatWorker("worker-1")
+	if err != nil {
+		t.Fatalf("failed to heartbeat worker-1: %v", err)
+	}
+
+	// 2. Lease Acquisition & Contention
+	// Setup run and step
+	run := &WorkflowRun{
+		RunID:           "run-1",
+		WorkflowName:    "test-workflow",
+		WorkflowVersion: 1,
+		Status:          "RUNNING",
+	}
+	_ = store.CreateRun(run)
+	_ = store.UpsertStepState(&StepState{
+		RunID:       "run-1",
+		StepID:      "step-1",
+		Status:      "PENDING",
+		Attempt:     0,
+		MaxAttempts: 3,
+	})
+
+	// Acquire w1 lease
+	acquired, err := store.AcquireLease("run-1", "step-1", "worker-1", 1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+	if !acquired {
+		t.Errorf("expected lease to be acquired by worker-1")
+	}
+
+	// Double check step state status updated to RUNNING and worker_id set
+	states, _ := store.GetStepStates("run-1")
+	if len(states) != 1 || states[0].Status != "RUNNING" || states[0].WorkerID != "worker-1" || states[0].Attempt != 1 {
+		t.Errorf("expected step state to be RUNNING/worker-1/attempt-1, got: %+v", states)
+	}
+
+	// Try acquire w2 lease (should fail/contend)
+	acquired, err = store.AcquireLease("run-1", "step-1", "worker-2", 1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+	if acquired {
+		t.Errorf("expected lease acquisition to fail due to contention")
+	}
+
+	// 3. Lease Renewal
+	renewed, err := store.RenewLease("run-1", "step-1", "worker-1", 5*time.Second)
+	if err != nil {
+		t.Fatalf("failed to renew lease: %v", err)
+	}
+	if !renewed {
+		t.Errorf("expected lease to be renewed for worker-1")
+	}
+
+	// Try renew for worker-2 on same step (should fail)
+	renewed, err = store.RenewLease("run-1", "step-1", "worker-2", 5*time.Second)
+	if err != nil {
+		t.Fatalf("failed to renew lease: %v", err)
+	}
+	if renewed {
+		t.Errorf("expected lease renewal for worker-2 to fail")
+	}
+
+	// 4. Lease Release
+	err = store.ReleaseLease("run-1", "step-1", "worker-1")
+	if err != nil {
+		t.Fatalf("failed to release lease: %v", err)
+	}
+
+	// Now worker-2 should be able to acquire lease (it is released)
+	acquired, err = store.AcquireLease("run-1", "step-1", "worker-2", 1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+	if !acquired {
+		t.Errorf("expected lease to be acquired by worker-2 after release")
+	}
+
+	// 5. Lease Expiration
+	// Set lease duration very short and wait
+	acquired, err = store.AcquireLease("run-1", "step-2", "worker-2", 2*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+	if !acquired {
+		t.Errorf("expected lease to be acquired by worker-2")
+	}
+
+	time.Sleep(5 * time.Millisecond)
+
+	// Now worker-1 should steal it (expired)
+	acquired, err = store.AcquireLease("run-1", "step-2", "worker-1", 1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+	if !acquired {
+		t.Errorf("expected lease on step-2 to be acquired by worker-1 after expiration")
+	}
+
+	// 6. Dead Worker Reclamation
+	// w1 owns step-2 now. Manually make w1's heartbeat stale (20 seconds ago)
+	staleHeartbeat := time.Now().Add(-20 * time.Second).UTC().Format(time.RFC3339Nano)
+	w1.LastHeartbeatAt = staleHeartbeat
+	_ = store.RegisterWorker(w1)
+
+	// worker-2 should reclaim the lease even though it has not expired in time
+	acquired, err = store.AcquireLease("run-1", "step-2", "worker-2", 1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+	if !acquired {
+		t.Errorf("expected lease on step-2 to be reclaimed by worker-2 due to dead worker-1")
+	}
+}
+
 

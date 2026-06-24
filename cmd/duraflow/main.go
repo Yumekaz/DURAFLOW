@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yumekaz/duraflow/internal/engine"
 	"github.com/yumekaz/duraflow/internal/executor"
 	"github.com/yumekaz/duraflow/internal/store"
+	"github.com/yumekaz/duraflow/internal/worker"
 	"github.com/yumekaz/duraflow/internal/workflow"
 )
 
@@ -35,6 +38,7 @@ func main() {
 	rootCmd.AddCommand(eventsCmd())
 	rootCmd.AddCommand(logsCmd())
 	rootCmd.AddCommand(resumeCmd())
+	rootCmd.AddCommand(workerCmd())
 	rootCmd.AddCommand(versionCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -92,58 +96,97 @@ func runCmd() *cobra.Command {
 			exec := executor.NewHostExecutor()
 			eng := engine.NewWorkflowEngine(s, exec)
 
-			var attemptStart time.Time
-
-			eng.OnEvent = func(ev *store.Event) {
-				switch ev.EventType {
-				case engine.EventStepStarted:
-					maxAttempts := 1
-					for _, st := range orderedSteps {
-						if st.ID == ev.StepID {
-							if st.Retry != nil && st.Retry.MaxAttempts > 0 {
-								maxAttempts = st.Retry.MaxAttempts
-							}
-							break
-						}
-					}
-					attemptStart = time.Now()
-					fmt.Printf("  [%s]    attempt %d/%d ... ", ev.StepID, ev.Attempt, maxAttempts)
-				
-				case engine.EventStepSucceeded:
-					dur := time.Since(attemptStart).Round(time.Millisecond)
-					fmt.Printf("SUCCEEDED (%v)\n", dur)
-				
-				case engine.EventStepRetryScheduled:
-					delayMs := int64(0)
-					if ev.PayloadJSON != "" {
-						var p struct {
-							DelayMs int64 `json:"delay_ms"`
-						}
-						_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
-						delayMs = p.DelayMs
-					}
-					delayStr := fmt.Sprintf("%v", time.Duration(delayMs)*time.Millisecond)
-					fmt.Printf("FAILED [retry in %s]\n", delayStr)
-				
-				case engine.EventStepFailedFinal:
-					errStr := "failed"
-					if ev.PayloadJSON != "" {
-						var p struct {
-							Error string `json:"error"`
-						}
-						_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
-						if p.Error != "" {
-							errStr = p.Error
-						}
-					}
-					fmt.Printf("FAILED (%s)\n", errStr)
-				}
-			}
-
 			fmt.Printf("Starting workflow %q...\n", def.Name)
 			runID, err := eng.RunWorkflow(context.Background(), def, orderedSteps, hash, string(data))
 			if err != nil {
 				return fmt.Errorf("workflow execution failed: %w", err)
+			}
+
+			lastID := int64(0)
+			completed := false
+			failed := false
+			stepStartTimes := make(map[string]time.Time)
+
+			for {
+				events, err := s.GetEvents(runID)
+				if err != nil {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+
+				for _, ev := range events {
+					if ev.ID <= lastID {
+						continue
+					}
+					lastID = ev.ID
+
+					switch ev.EventType {
+					case engine.EventStepStarted:
+						maxAttempts := 1
+						for _, st := range orderedSteps {
+							if st.ID == ev.StepID {
+								if st.Retry != nil && st.Retry.MaxAttempts > 0 {
+									maxAttempts = st.Retry.MaxAttempts
+								}
+								break
+							}
+						}
+						tStr := ev.CreatedAt
+						tVal, err := time.Parse(time.RFC3339Nano, tStr)
+						if err == nil {
+							stepStartTimes[ev.StepID] = tVal
+						} else {
+							stepStartTimes[ev.StepID] = time.Now()
+						}
+						fmt.Printf("  [%s]    attempt %d/%d ... ", ev.StepID, ev.Attempt, maxAttempts)
+
+					case engine.EventStepSucceeded:
+						tStr := ev.CreatedAt
+						tVal, err := time.Parse(time.RFC3339Nano, tStr)
+						dur := time.Duration(0)
+						if err == nil && !stepStartTimes[ev.StepID].IsZero() {
+							dur = tVal.Sub(stepStartTimes[ev.StepID]).Round(time.Millisecond)
+						}
+						fmt.Printf("SUCCEEDED (%v)\n", dur)
+
+					case engine.EventStepRetryScheduled:
+						delayMs := int64(0)
+						if ev.PayloadJSON != "" {
+							var p struct {
+								DelayMs int64 `json:"delay_ms"`
+							}
+							_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
+							delayMs = p.DelayMs
+						}
+						delayStr := fmt.Sprintf("%v", time.Duration(delayMs)*time.Millisecond)
+						fmt.Printf("FAILED [retry in %s]\n", delayStr)
+
+					case engine.EventStepFailedFinal:
+						errStr := "failed"
+						if ev.PayloadJSON != "" {
+							var p struct {
+								Error string `json:"error"`
+							}
+							_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
+							if p.Error != "" {
+								errStr = p.Error
+							}
+						}
+						fmt.Printf("FAILED (%s)\n", errStr)
+
+					case engine.EventWorkflowCompleted:
+						completed = true
+
+					case engine.EventWorkflowFailed:
+						failed = true
+					}
+				}
+
+				if completed || failed {
+					break
+				}
+
+				time.Sleep(100 * time.Millisecond)
 			}
 
 			run, err := s.GetRun(runID)
@@ -506,71 +549,117 @@ func resumeCmd() *cobra.Command {
 					}
 				}
 
-				resumedSteps := make(map[string]bool)
-				var attemptStart time.Time
-
-				eng.OnEvent = func(ev *store.Event) {
-					if ev.RunID != runID {
-						return
-					}
-					switch ev.EventType {
-					case engine.EventStepResumed:
-						resumedSteps[ev.StepID] = true
-						fmt.Printf("  [%s]    resuming ", ev.StepID)
-					
-					case engine.EventStepStarted:
-						maxAttempts := 1
-						for _, st := range orderedSteps {
-							if st.ID == ev.StepID {
-								if st.Retry != nil && st.Retry.MaxAttempts > 0 {
-									maxAttempts = st.Retry.MaxAttempts
-								}
-								break
-							}
-						}
-						attemptStart = time.Now()
-						if resumedSteps[ev.StepID] {
-							fmt.Printf("attempt %d/%d ... ", ev.Attempt, maxAttempts)
-							resumedSteps[ev.StepID] = false
-						} else {
-							fmt.Printf("  [%s]    attempt %d/%d ... ", ev.StepID, ev.Attempt, maxAttempts)
-						}
-
-					case engine.EventStepSucceeded:
-						dur := time.Since(attemptStart).Round(time.Millisecond)
-						fmt.Printf("SUCCEEDED (%v)\n", dur)
-
-					case engine.EventStepRetryScheduled:
-						delayMs := int64(0)
-						if ev.PayloadJSON != "" {
-							var p struct {
-								DelayMs int64 `json:"delay_ms"`
-							}
-							_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
-							delayMs = p.DelayMs
-						}
-						delayStr := fmt.Sprintf("%v", time.Duration(delayMs)*time.Millisecond)
-						fmt.Printf("FAILED [retry in %s]\n", delayStr)
-
-					case engine.EventStepFailedFinal:
-						errStr := "failed"
-						if ev.PayloadJSON != "" {
-							var p struct {
-								Error string `json:"error"`
-							}
-							_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
-							if p.Error != "" {
-								errStr = p.Error
-							}
-						}
-						fmt.Printf("FAILED (%s)\n", errStr)
-					}
+				// Find max event ID to start tailing from
+				existingEvents, err := s.GetEvents(runID)
+				lastID := int64(0)
+				if err == nil && len(existingEvents) > 0 {
+					lastID = existingEvents[len(existingEvents)-1].ID
 				}
 
 				err = eng.ResumeWorkflow(context.Background(), runID)
 				if err != nil {
 					fmt.Printf("Error resuming run %s: %v\n", runID, err)
 					continue
+				}
+
+				resumedSteps := make(map[string]bool)
+				stepStartTimes := make(map[string]time.Time)
+				completed := false
+				failed := false
+
+				for {
+					events, err := s.GetEvents(runID)
+					if err != nil {
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
+
+					for _, ev := range events {
+						if ev.ID <= lastID {
+							continue
+						}
+						lastID = ev.ID
+
+						if ev.RunID != runID {
+							continue
+						}
+
+						switch ev.EventType {
+						case engine.EventStepResumed:
+							resumedSteps[ev.StepID] = true
+							fmt.Printf("  [%s]    resuming ", ev.StepID)
+
+						case engine.EventStepStarted:
+							maxAttempts := 1
+							for _, st := range orderedSteps {
+								if st.ID == ev.StepID {
+									if st.Retry != nil && st.Retry.MaxAttempts > 0 {
+										maxAttempts = st.Retry.MaxAttempts
+									}
+									break
+								}
+							}
+							tStr := ev.CreatedAt
+							tVal, err := time.Parse(time.RFC3339Nano, tStr)
+							if err == nil {
+								stepStartTimes[ev.StepID] = tVal
+							} else {
+								stepStartTimes[ev.StepID] = time.Now()
+							}
+							if resumedSteps[ev.StepID] {
+								fmt.Printf("attempt %d/%d ... ", ev.Attempt, maxAttempts)
+								resumedSteps[ev.StepID] = false
+							} else {
+								fmt.Printf("  [%s]    attempt %d/%d ... ", ev.StepID, ev.Attempt, maxAttempts)
+							}
+
+						case engine.EventStepSucceeded:
+							tStr := ev.CreatedAt
+							tVal, err := time.Parse(time.RFC3339Nano, tStr)
+							dur := time.Duration(0)
+							if err == nil && !stepStartTimes[ev.StepID].IsZero() {
+								dur = tVal.Sub(stepStartTimes[ev.StepID]).Round(time.Millisecond)
+							}
+							fmt.Printf("SUCCEEDED (%v)\n", dur)
+
+						case engine.EventStepRetryScheduled:
+							delayMs := int64(0)
+							if ev.PayloadJSON != "" {
+								var p struct {
+									DelayMs int64 `json:"delay_ms"`
+								}
+								_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
+								delayMs = p.DelayMs
+							}
+							delayStr := fmt.Sprintf("%v", time.Duration(delayMs)*time.Millisecond)
+							fmt.Printf("FAILED [retry in %s]\n", delayStr)
+
+						case engine.EventStepFailedFinal:
+							errStr := "failed"
+							if ev.PayloadJSON != "" {
+								var p struct {
+									Error string `json:"error"`
+								}
+								_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
+								if p.Error != "" {
+									errStr = p.Error
+								}
+							}
+							fmt.Printf("FAILED (%s)\n", errStr)
+
+						case engine.EventWorkflowCompleted:
+							completed = true
+
+						case engine.EventWorkflowFailed:
+							failed = true
+						}
+					}
+
+					if completed || failed {
+						break
+					}
+
+					time.Sleep(100 * time.Millisecond)
 				}
 
 				// Fetch updated details
@@ -585,6 +674,54 @@ func resumeCmd() *cobra.Command {
 				}
 			}
 
+			return nil
+		},
+	}
+}
+
+func workerCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "worker",
+		Short: "Manage background execution workers",
+	}
+	cmd.AddCommand(workerStartCmd())
+	return cmd
+}
+
+func workerStartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "start",
+		Short: "Start a background execution worker daemon",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := getStore()
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+
+			exec := executor.NewHostExecutor()
+			eng := engine.NewWorkflowEngine(s, exec)
+
+			w := worker.NewWorkerDaemon(s, eng)
+			if err := w.Start(); err != nil {
+				return fmt.Errorf("failed to start worker: %w", err)
+			}
+
+			hostname, _ := os.Hostname()
+			fmt.Printf("Worker daemon started successfully.\n")
+			fmt.Printf("  Worker ID: %s\n", w.WorkerID())
+			fmt.Printf("  Hostname:  %s\n", hostname)
+			fmt.Printf("  PID:       %d\n", os.Getpid())
+			fmt.Println("Press Ctrl+C to stop.")
+
+			// Wait for interrupt signal to gracefully exit
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+			<-sigChan
+
+			fmt.Println("\nShutting down worker daemon gracefully...")
+			w.Stop()
+			fmt.Println("Worker daemon stopped.")
 			return nil
 		},
 	}

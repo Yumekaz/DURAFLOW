@@ -69,4 +69,28 @@ CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_step_states_run ON step_states(run_id);
 CREATE INDEX IF NOT EXISTS idx_logs_run_step ON logs(run_id, step_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON workflow_runs(status);
+
+-- Workers registration
+CREATE TABLE IF NOT EXISTS workers (
+    worker_id          TEXT PRIMARY KEY,
+    hostname           TEXT NOT NULL,
+    pid                INTEGER NOT NULL,
+    started_at         TEXT NOT NULL,
+    last_heartbeat_at  TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'ACTIVE'
+);
+
+-- Task leases
+CREATE TABLE IF NOT EXISTS leases (
+    run_id      TEXT NOT NULL,
+    step_id     TEXT NOT NULL,
+    worker_id   TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'ACTIVE', -- 'ACTIVE' | 'RELEASED'
+    PRIMARY KEY (run_id, step_id),
+    FOREIGN KEY(run_id) REFERENCES workflow_runs(run_id),
+    FOREIGN KEY(worker_id) REFERENCES workers(worker_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_leases_worker ON leases(worker_id);
 `
