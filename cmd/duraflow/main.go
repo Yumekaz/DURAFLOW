@@ -13,6 +13,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"github.com/spf13/cobra"
+	"github.com/yumekaz/duraflow/internal/api"
 	"github.com/yumekaz/duraflow/internal/engine"
 	"github.com/yumekaz/duraflow/internal/executor"
 	"github.com/yumekaz/duraflow/internal/store"
@@ -43,6 +44,7 @@ func main() {
 	rootCmd.AddCommand(cronCmd())
 	rootCmd.AddCommand(cancelCmd())
 	rootCmd.AddCommand(retryCmd())
+	rootCmd.AddCommand(serverCmd())
 	rootCmd.AddCommand(versionCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -1064,6 +1066,64 @@ func retryCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&stepIDFlag, "step", "", "The step ID to retry (optional if there is only one failed step)")
+	return cmd
+}
+
+func serverCmd() *cobra.Command {
+	var port int
+	var addr string
+	var runWorker bool
+
+	cmd := &cobra.Command{
+		Use:   "server",
+		Short: "Start the DuraFlow REST API HTTP server",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := getStore()
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+
+			exec := executor.NewHostExecutor()
+			eng := engine.NewWorkflowEngine(s, exec)
+
+			bindAddr := addr
+			if bindAddr == "" {
+				bindAddr = fmt.Sprintf("127.0.0.1:%d", port)
+			} else if !strings.Contains(bindAddr, ":") {
+				bindAddr = fmt.Sprintf("%s:%d", bindAddr, port)
+			}
+
+			srv := api.NewServer(s, eng, bindAddr, runWorker)
+			if err := srv.Start(); err != nil {
+				return err
+			}
+
+			fmt.Printf("DuraFlow API Server started successfully.\n")
+			fmt.Printf("  Listen Address: http://%s\n", bindAddr)
+			if runWorker {
+				fmt.Printf("  Worker daemon running in-process.\n")
+			} else {
+				fmt.Printf("  Worker daemon disabled. Run 'duraflow worker start' separately to process workflows.\n")
+			}
+			fmt.Printf("  Database:       %s\n", dbPathFlag)
+			fmt.Println("Press Ctrl+C to stop.")
+
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+			<-sigChan
+
+			fmt.Println("\nShutting down API Server gracefully...")
+			srv.Stop()
+			fmt.Println("API Server stopped.")
+			return nil
+		},
+	}
+
+	cmd.Flags().IntVar(&port, "port", 8080, "Port to listen on")
+	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1", "IP address or network interface to bind to")
+	cmd.Flags().BoolVar(&runWorker, "worker", false, "Run a background execution worker daemon in-process")
+
 	return cmd
 }
 
