@@ -114,14 +114,19 @@ func (e *WorkflowEngine) ResumeWorkflow(ctx context.Context, runID string) error
 	}
 
 	// 2. Check if run is in a resumable status
-	if run.Status == StatusCompleted || run.Status == StatusFailed {
+	if run.Status == StatusCompleted || run.Status == StatusCompensated {
 		return fmt.Errorf("cannot resume workflow run %s: status is already %s", runID, run.Status)
 	}
 
-	// 3. Update status to RUNNING if not already, and append WorkflowResumed event
+	// 3. Update status and append WorkflowResumed event
+	targetStatus := StatusRunning
+	if run.Status == StatusCompensating || run.Status == StatusCompensationFailed {
+		targetStatus = StatusCompensating
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if err := e.store.UpdateRunStatus(runID, StatusRunning, map[string]string{"started_at": now}); err != nil {
-		return fmt.Errorf("failed to update run status to running: %w", err)
+	if err := e.store.UpdateRunStatus(runID, targetStatus, map[string]string{"started_at": now}); err != nil {
+		return fmt.Errorf("failed to update run status to %s: %w", targetStatus, err)
 	}
 
 	err = e.appendEvent(&store.Event{
@@ -363,6 +368,39 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 			PayloadJSON:  fmt.Sprintf(`{"error":%q}`, stepErrStr),
 		})
 
+		// Check if we need to compensate
+		if def.OnFailure != nil && def.OnFailure.Compensate {
+			states, err := e.store.GetStepStates(runID)
+			hasCompensation := false
+			if err == nil {
+				for _, stepDef := range def.Steps {
+					if stepDef.Compensation != nil && stepDef.Compensation.Run != "" {
+						for _, stState := range states {
+							if stState.StepID == stepDef.ID && stState.Status == StepSucceeded {
+								hasCompensation = true
+								break
+							}
+						}
+					}
+					if hasCompensation {
+						break
+					}
+				}
+			}
+
+			if hasCompensation {
+				now = time.Now().UTC().Format(time.RFC3339Nano)
+				_ = e.store.UpdateRunStatus(runID, StatusCompensating, nil)
+				_ = e.appendEvent(&store.Event{
+					RunID:        runID,
+					WorkflowName: def.Name,
+					EventType:    EventWorkflowCompensationStarted,
+					PayloadJSON:  fmt.Sprintf(`{"failed_step":%q,"error":%q}`, step.ID, stepErrStr),
+				})
+				return fmt.Errorf("step execution failed: %s; entering compensation", stepErrStr)
+			}
+		}
+
 		// Mark workflow run as FAILED
 		now = time.Now().UTC().Format(time.RFC3339Nano)
 		_ = e.store.UpdateRunStatus(runID, StatusFailed, map[string]string{"failed_at": now})
@@ -459,4 +497,19 @@ func isRetryable(policy *workflow.RetryPolicy, exitCode int) bool {
 	}
 
 	return true
+}
+
+func (e *WorkflowEngine) ExecuteCompensationStep(ctx context.Context, runID string, def *workflow.WorkflowDef, step workflow.StepDef) (*executor.Result, error) {
+	if step.Compensation == nil || step.Compensation.Run == "" {
+		return &executor.Result{ExitCode: 0}, nil
+	}
+
+	stepEnv := make(map[string]string)
+	for k, v := range def.Env {
+		stepEnv[k] = v
+	}
+	stepEnv["DURAFLOW_RUN_ID"] = runID
+	stepEnv["DURAFLOW_STEP_ID"] = step.ID
+
+	return e.executor.Execute(ctx, step.Compensation.Run, stepEnv)
 }

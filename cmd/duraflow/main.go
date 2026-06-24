@@ -41,6 +41,8 @@ func main() {
 	rootCmd.AddCommand(resumeCmd())
 	rootCmd.AddCommand(workerCmd())
 	rootCmd.AddCommand(cronCmd())
+	rootCmd.AddCommand(cancelCmd())
+	rootCmd.AddCommand(retryCmd())
 	rootCmd.AddCommand(versionCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -219,6 +221,59 @@ func runCmd() *cobra.Command {
 
 					case engine.EventWorkflowFailed:
 						failed = true
+
+					case engine.EventWorkflowCancelled:
+						fmt.Printf("Workflow cancelled by operator.\n")
+						failed = true
+
+					case engine.EventWorkflowCompensationStarted:
+						fmt.Printf("Workflow failed; triggering compensation rollback...\n")
+
+					case engine.EventWorkflowCompensationCompleted:
+						fmt.Printf("Workflow compensated successfully.\n")
+						completed = true
+
+					case engine.EventWorkflowCompensationFailed:
+						fmt.Printf("Workflow compensation failed!\n")
+						failed = true
+
+					case engine.EventStepCompensating:
+						tStr := ev.CreatedAt
+						tVal, err := time.Parse(time.RFC3339Nano, tStr)
+						if err == nil {
+							stepStartTimes[ev.StepID] = tVal
+						} else {
+							stepStartTimes[ev.StepID] = time.Now()
+						}
+						fmt.Printf("  [%s]    compensating ... ", ev.StepID)
+
+					case engine.EventStepCompensated:
+						tStr := ev.CreatedAt
+						tVal, err := time.Parse(time.RFC3339Nano, tStr)
+						dur := time.Duration(0)
+						if err == nil && !stepStartTimes[ev.StepID].IsZero() {
+							dur = tVal.Sub(stepStartTimes[ev.StepID]).Round(time.Millisecond)
+						}
+						fmt.Printf("COMPENSATED (%v)\n", dur)
+
+					case engine.EventStepCompensationFailed:
+						tStr := ev.CreatedAt
+						tVal, err := time.Parse(time.RFC3339Nano, tStr)
+						dur := time.Duration(0)
+						if err == nil && !stepStartTimes[ev.StepID].IsZero() {
+							dur = tVal.Sub(stepStartTimes[ev.StepID]).Round(time.Millisecond)
+						}
+						errStr := "failed"
+						if ev.PayloadJSON != "" {
+							var p struct {
+								Error string `json:"error"`
+							}
+							_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
+							if p.Error != "" {
+								errStr = p.Error
+							}
+						}
+						fmt.Printf("COMPENSATION_FAILED (%s) (%v)\n", errStr, dur)
 					}
 				}
 
@@ -692,6 +747,59 @@ func resumeCmd() *cobra.Command {
 
 						case engine.EventWorkflowFailed:
 							failed = true
+
+						case engine.EventWorkflowCancelled:
+							fmt.Printf("Workflow cancelled by operator.\n")
+							failed = true
+
+						case engine.EventWorkflowCompensationStarted:
+							fmt.Printf("Workflow failed; triggering compensation rollback...\n")
+
+						case engine.EventWorkflowCompensationCompleted:
+							fmt.Printf("Workflow compensated successfully.\n")
+							completed = true
+
+						case engine.EventWorkflowCompensationFailed:
+							fmt.Printf("Workflow compensation failed!\n")
+							failed = true
+
+						case engine.EventStepCompensating:
+							tStr := ev.CreatedAt
+							tVal, err := time.Parse(time.RFC3339Nano, tStr)
+							if err == nil {
+								stepStartTimes[ev.StepID] = tVal
+							} else {
+								stepStartTimes[ev.StepID] = time.Now()
+							}
+							fmt.Printf("  [%s]    compensating ... ", ev.StepID)
+
+						case engine.EventStepCompensated:
+							tStr := ev.CreatedAt
+							tVal, err := time.Parse(time.RFC3339Nano, tStr)
+							dur := time.Duration(0)
+							if err == nil && !stepStartTimes[ev.StepID].IsZero() {
+								dur = tVal.Sub(stepStartTimes[ev.StepID]).Round(time.Millisecond)
+							}
+							fmt.Printf("COMPENSATED (%v)\n", dur)
+
+						case engine.EventStepCompensationFailed:
+							tStr := ev.CreatedAt
+							tVal, err := time.Parse(time.RFC3339Nano, tStr)
+							dur := time.Duration(0)
+							if err == nil && !stepStartTimes[ev.StepID].IsZero() {
+								dur = tVal.Sub(stepStartTimes[ev.StepID]).Round(time.Millisecond)
+							}
+							errStr := "failed"
+							if ev.PayloadJSON != "" {
+								var p struct {
+									Error string `json:"error"`
+								}
+								_ = json.Unmarshal([]byte(ev.PayloadJSON), &p)
+								if p.Error != "" {
+									errStr = p.Error
+								}
+							}
+							fmt.Printf("COMPENSATION_FAILED (%s) (%v)\n", errStr, dur)
 						}
 					}
 
@@ -815,5 +923,147 @@ func cronListCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func cancelCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "cancel [run_id]",
+		Short: "Cancel an active workflow run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runID := args[0]
+			s, err := getStore()
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+
+			if err := s.CancelWorkflowRun(runID); err != nil {
+				return err
+			}
+
+			fmt.Printf("Workflow run %s successfully cancelled.\n", runID)
+			return nil
+		},
+	}
+}
+
+func retryCmd() *cobra.Command {
+	var stepIDFlag string
+	cmd := &cobra.Command{
+		Use:   "retry [run_id]",
+		Short: "Retry a failed step in a failed workflow run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runID := args[0]
+			s, err := getStore()
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+
+			run, err := s.GetRun(runID)
+			if err != nil {
+				return fmt.Errorf("failed to fetch run details: %w", err)
+			}
+			if run == nil {
+				return fmt.Errorf("workflow run not found: %s", runID)
+			}
+
+			if run.Status != engine.StatusFailed && run.Status != engine.StatusCompensationFailed && run.Status != engine.StatusCancelled {
+				return fmt.Errorf("workflow run %s is in status %s; can only retry runs in status FAILED, COMPENSATION_FAILED, or CANCELLED", runID, run.Status)
+			}
+
+			stepID := stepIDFlag
+			if stepID == "" {
+				// Search for a failed or cancelled step in step states
+				states, err := s.GetStepStates(runID)
+				if err != nil {
+					return fmt.Errorf("failed to fetch step states: %w", err)
+				}
+				var failedSteps []string
+				for _, st := range states {
+					if st.Status == engine.StepFailedFinal || st.Status == engine.StepCompensationFailed || (run.Status == engine.StatusCancelled && st.Status == engine.StepRunning) {
+						failedSteps = append(failedSteps, st.StepID)
+					}
+				}
+				if len(failedSteps) == 0 {
+					return fmt.Errorf("could not find any failed or cancelled step to retry in run %s", runID)
+				}
+				if len(failedSteps) > 1 {
+					return fmt.Errorf("multiple failed/cancelled steps found (%s); please specify which step to retry using --step flag", strings.Join(failedSteps, ", "))
+				}
+				stepID = failedSteps[0]
+			}
+
+			// Determine if it was a compensation step failure or regular step failure
+			states, err := s.GetStepStates(runID)
+			if err != nil {
+				return fmt.Errorf("failed to fetch step states: %w", err)
+			}
+			var targetState *store.StepState
+			for _, st := range states {
+				if st.StepID == stepID {
+					targetState = st
+					break
+				}
+			}
+			if targetState == nil {
+				return fmt.Errorf("step %s not found in workflow run %s", stepID, runID)
+			}
+
+			if targetState.Status == engine.StepCompensationFailed {
+				// Retry compensation: reset to SUCCEEDED and set run back to COMPENSATING
+				if err := s.ResetStepState(runID, stepID); err != nil {
+					return err
+				}
+				// Wait! ResetStepState sets status to PENDING. We need status to be SUCCEEDED so it's a compensation candidate!
+				// Let's manually transition it to SUCCEEDED!
+				targetState.Status = engine.StepSucceeded
+				targetState.LastError = ""
+				targetState.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+				if err := s.UpsertStepState(targetState); err != nil {
+					return fmt.Errorf("failed to restore step status to SUCCEEDED: %w", err)
+				}
+
+				if err := s.ResetWorkflowRunForRetry(runID, engine.StatusCompensating); err != nil {
+					return err
+				}
+
+				_ = s.AppendEvent(&store.Event{
+					RunID:        runID,
+					WorkflowName: run.WorkflowName,
+					EventType:    engine.EventWorkflowResumed,
+					StepID:       stepID,
+					PayloadJSON:  fmt.Sprintf(`{"message":%q}`, "Manual retry of step compensation triggered"),
+				})
+
+				fmt.Printf("Triggered manual retry for compensation of step %s in run %s. Run status reset to COMPENSATING.\n", stepID, runID)
+			} else {
+				// Regular step retry: reset status to PENDING
+				if err := s.ResetStepState(runID, stepID); err != nil {
+					return err
+				}
+
+				if err := s.ResetWorkflowRunForRetry(runID, engine.StatusRunning); err != nil {
+					return err
+				}
+
+				_ = s.AppendEvent(&store.Event{
+					RunID:        runID,
+					WorkflowName: run.WorkflowName,
+					EventType:    engine.EventWorkflowResumed,
+					StepID:       stepID,
+					PayloadJSON:  fmt.Sprintf(`{"message":%q}`, "Manual retry of step triggered"),
+				})
+
+				fmt.Printf("Triggered manual retry for step %s in run %s. Run status reset to RUNNING.\n", stepID, runID)
+			}
+
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&stepIDFlag, "step", "", "The step ID to retry (optional if there is only one failed step)")
+	return cmd
 }
 

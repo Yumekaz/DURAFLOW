@@ -105,6 +105,9 @@ type EventStore interface {
 	GetRun(runID string) (*WorkflowRun, error)
 	ListRuns(limit int) ([]*WorkflowRun, error)
 	GetIncompleteRuns() ([]*WorkflowRun, error)
+	ResetStepState(runID, stepID string) error
+	CancelWorkflowRun(runID string) error
+	ResetWorkflowRunForRetry(runID string, status string) error
 
 	// Events (append-only)
 	AppendEvent(event *Event) error

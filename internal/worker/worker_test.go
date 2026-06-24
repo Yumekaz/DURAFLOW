@@ -251,3 +251,283 @@ steps:
 		t.Fatalf("expected different run IDs, got same: %s", run1.RunID)
 	}
 }
+
+func TestWorkerDaemon_CompensationSuccess(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "duraflow-worker-comp-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "duraflow.db")
+	dbStore := store.NewSQLiteStore(dbPath)
+	if err := dbStore.Init(); err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer dbStore.Close()
+
+	hostExec := executor.NewHostExecutor()
+	eng := engine.NewWorkflowEngine(dbStore, hostExec)
+	w := NewWorkerDaemon(dbStore, eng)
+
+	// Register worker
+	hostname, _ := os.Hostname()
+	err = dbStore.RegisterWorker(&store.Worker{
+		WorkerID:        w.workerID,
+		Hostname:        hostname,
+		PID:             os.Getpid(),
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		LastHeartbeatAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Status:          "ACTIVE",
+	})
+	if err != nil {
+		t.Fatalf("failed to register worker: %v", err)
+	}
+
+	// Define workflow with on_failure: compensate: true
+	yamlContent := `
+name: comp-test-workflow
+version: 1
+on_failure:
+  compensate: true
+steps:
+  - id: step-1
+    run: "echo 'step-1 succeeded'"
+    compensation:
+      run: "echo 'step-1 compensated'"
+  - id: step-2
+    run: "echo 'step-2 succeeded'"
+    depends_on: ["step-1"]
+  - id: step-3
+    run: "false" # Fails immediately
+    depends_on: ["step-2"]
+    compensation:
+      run: "echo 'step-3 compensated'"
+`
+	def, hash, orderedSteps, err := workflow.ParseAndValidate([]byte(yamlContent))
+	if err != nil {
+		t.Fatalf("failed to parse workflow: %v", err)
+	}
+
+	runID, err := eng.RunWorkflow(context.Background(), def, orderedSteps, hash, yamlContent)
+	if err != nil {
+		t.Fatalf("failed to run workflow: %v", err)
+	}
+
+	// 1. Execute step-1
+	w.scanAndRunEligibleSteps()
+	w.wg.Wait()
+
+	// 2. Execute step-2
+	w.scanAndRunEligibleSteps()
+	w.wg.Wait()
+
+	// 3. Execute step-3 (which will fail and trigger compensation)
+	w.scanAndRunEligibleSteps()
+	w.wg.Wait()
+
+	// Check that run transitioned to COMPENSATING status
+	run, err := dbStore.GetRun(runID)
+	if err != nil {
+		t.Fatalf("failed to get run: %v", err)
+	}
+	if run.Status != engine.StatusCompensating {
+		t.Fatalf("expected run status COMPENSATING, got %s", run.Status)
+	}
+
+	// Check step states
+	states, _ := dbStore.GetStepStates(runID)
+	stateMap := make(map[string]string)
+	for _, st := range states {
+		stateMap[st.StepID] = st.Status
+	}
+	if stateMap["step-1"] != engine.StepSucceeded {
+		t.Errorf("step-1 should be SUCCEEDED, got %s", stateMap["step-1"])
+	}
+	if stateMap["step-2"] != engine.StepSucceeded {
+		t.Errorf("step-2 should be SUCCEEDED, got %s", stateMap["step-2"])
+	}
+	if stateMap["step-3"] != engine.StepFailedFinal {
+		t.Errorf("step-3 should be FAILED_FINAL, got %s", stateMap["step-3"])
+	}
+
+	// 4. Run compensation.
+	// Since step-3 failed (not succeeded), only step-1 has a compensation block and succeeded.
+	// (step-2 has no compensation block).
+	// So step-1's compensation should run and complete.
+	w.scanAndRunEligibleSteps()
+	w.wg.Wait()
+
+	// Call scan again to trigger run-level state transition after steps are compensated
+	w.scanAndRunEligibleSteps()
+
+	// Check step states again: step-1 should be COMPENSATED
+	states, _ = dbStore.GetStepStates(runID)
+	for _, st := range states {
+		stateMap[st.StepID] = st.Status
+	}
+	if stateMap["step-1"] != engine.StepCompensated {
+		t.Errorf("step-1 should be COMPENSATED, got %s", stateMap["step-1"])
+	}
+
+	// Check run status again: should be COMPENSATED
+	run, _ = dbStore.GetRun(runID)
+	if run.Status != engine.StatusCompensated {
+		t.Fatalf("expected run status COMPENSATED, got %s", run.Status)
+	}
+}
+
+func TestWorkerDaemon_CompensationFailure(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "duraflow-worker-comp-fail-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "duraflow.db")
+	dbStore := store.NewSQLiteStore(dbPath)
+	if err := dbStore.Init(); err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer dbStore.Close()
+
+	hostExec := executor.NewHostExecutor()
+	eng := engine.NewWorkflowEngine(dbStore, hostExec)
+	w := NewWorkerDaemon(dbStore, eng)
+
+	hostname, _ := os.Hostname()
+	_ = dbStore.RegisterWorker(&store.Worker{
+		WorkerID:        w.workerID,
+		Hostname:        hostname,
+		PID:             os.Getpid(),
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		LastHeartbeatAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Status:          "ACTIVE",
+	})
+
+	yamlContent := `
+name: comp-fail-workflow
+version: 1
+on_failure:
+  compensate: true
+steps:
+  - id: step-1
+    run: "echo 'hello'"
+    compensation:
+      run: "false" # Fails!
+  - id: step-2
+    run: "false"
+    depends_on: ["step-1"]
+`
+	def, hash, orderedSteps, err := workflow.ParseAndValidate([]byte(yamlContent))
+	if err != nil {
+		t.Fatalf("failed to parse workflow: %v", err)
+	}
+
+	runID, err := eng.RunWorkflow(context.Background(), def, orderedSteps, hash, yamlContent)
+	if err != nil {
+		t.Fatalf("failed to run workflow: %v", err)
+	}
+
+	// Execute step-1
+	w.scanAndRunEligibleSteps()
+	w.wg.Wait()
+
+	// Execute step-2 (fails)
+	w.scanAndRunEligibleSteps()
+	w.wg.Wait()
+
+	// Verify run is COMPENSATING
+	run, _ := dbStore.GetRun(runID)
+	if run.Status != engine.StatusCompensating {
+		t.Fatalf("expected run status COMPENSATING, got %s", run.Status)
+	}
+
+	// Run compensation (fails)
+	w.scanAndRunEligibleSteps()
+	w.wg.Wait()
+
+	// Call scan again to trigger run-level state transition after step compensation fails
+	w.scanAndRunEligibleSteps()
+
+	// Verify step-1 status is COMPENSATION_FAILED
+	states, _ := dbStore.GetStepStates(runID)
+	for _, st := range states {
+		if st.StepID == "step-1" && st.Status != engine.StepCompensationFailed {
+			t.Errorf("expected step-1 status COMPENSATION_FAILED, got %s", st.Status)
+		}
+	}
+
+	// Verify run status is COMPENSATION_FAILED
+	run, _ = dbStore.GetRun(runID)
+	if run.Status != engine.StatusCompensationFailed {
+		t.Fatalf("expected run status COMPENSATION_FAILED, got %s", run.Status)
+	}
+}
+
+func TestWorkerDaemon_ManualCancelAndRetry(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "duraflow-worker-cancel-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "duraflow.db")
+	dbStore := store.NewSQLiteStore(dbPath)
+	if err := dbStore.Init(); err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer dbStore.Close()
+
+	hostExec := executor.NewHostExecutor()
+	eng := engine.NewWorkflowEngine(dbStore, hostExec)
+
+	yamlContent := `
+name: cancel-workflow
+version: 1
+steps:
+  - id: step-1
+    run: "echo 'hello'"
+`
+	def, hash, orderedSteps, err := workflow.ParseAndValidate([]byte(yamlContent))
+	if err != nil {
+		t.Fatalf("failed to parse workflow: %v", err)
+	}
+
+	runID, err := eng.RunWorkflow(context.Background(), def, orderedSteps, hash, yamlContent)
+	if err != nil {
+		t.Fatalf("failed to run workflow: %v", err)
+	}
+
+	// Cancel the run
+	if err := dbStore.CancelWorkflowRun(runID); err != nil {
+		t.Fatalf("failed to cancel run: %v", err)
+	}
+
+	run, _ := dbStore.GetRun(runID)
+	if run.Status != engine.StatusCancelled {
+		t.Fatalf("expected status CANCELLED, got %s", run.Status)
+	}
+
+	// Verify cancel event is present
+	events, _ := dbStore.GetEvents(runID)
+	foundCancel := false
+	for _, ev := range events {
+		if ev.EventType == engine.EventWorkflowCancelled {
+			foundCancel = true
+			break
+		}
+	}
+	if !foundCancel {
+		t.Errorf("expected EventWorkflowCancelled, but not found")
+	}
+
+	// Reset workflow run for retry (simulating retry command)
+	if err := dbStore.ResetWorkflowRunForRetry(runID, engine.StatusRunning); err != nil {
+		t.Fatalf("failed to reset workflow run: %v", err)
+	}
+	run, _ = dbStore.GetRun(runID)
+	if run.Status != engine.StatusRunning {
+		t.Fatalf("expected status RUNNING, got %s", run.Status)
+	}
+}

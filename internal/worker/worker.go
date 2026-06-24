@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -170,6 +171,11 @@ func (w *WorkerDaemon) scanAndRunEligibleSteps() {
 		// Load step states
 		states, err := w.store.GetStepStates(run.RunID)
 		if err != nil {
+			continue
+		}
+
+		if run.Status == engine.StatusCompensating {
+			w.handleCompensation(run, def, orderedSteps, states)
 			continue
 		}
 
@@ -374,4 +380,210 @@ func (w *WorkerDaemon) leaseRenewalLoop(runID, stepID string, duration time.Dura
 			}
 		}
 	}
+}
+
+func (w *WorkerDaemon) handleCompensation(run *store.WorkflowRun, def *workflow.WorkflowDef, orderedSteps []workflow.StepDef, states []*store.StepState) {
+	// Find all steps that have compensation
+	compStepsMap := make(map[string]workflow.StepDef)
+	for _, step := range orderedSteps {
+		if step.Compensation != nil && step.Compensation.Run != "" {
+			compStepsMap[step.ID] = step
+		}
+	}
+
+	stateMap := make(map[string]*store.StepState)
+	for _, st := range states {
+		stateMap[st.StepID] = st
+	}
+
+	// Candidates for compensation: steps that succeeded, are currently compensating, compensated, or failed compensation
+	type compCandidate struct {
+		step        workflow.StepDef
+		state       *store.StepState
+		completedAt string
+	}
+	var candidates []compCandidate
+
+	for id, step := range compStepsMap {
+		st, ok := stateMap[id]
+		if ok {
+			if st.Status == engine.StepSucceeded || 
+			   st.Status == engine.StepCompensating || 
+			   st.Status == engine.StepCompensated || 
+			   st.Status == engine.StepCompensationFailed {
+				candidates = append(candidates, compCandidate{
+					step:        step,
+					state:       st,
+					completedAt: st.CompletedAt,
+				})
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		// Nothing to compensate! Mark run as COMPENSATED
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		_ = w.store.UpdateRunStatus(run.RunID, engine.StatusCompensated, map[string]string{"completed_at": now})
+		_ = w.eng.AppendEvent(&store.Event{
+			RunID:        run.RunID,
+			WorkflowName: def.Name,
+			EventType:    engine.EventWorkflowCompensationCompleted,
+			PayloadJSON:  "{}",
+		})
+		return
+	}
+
+	// Sort candidates by completed_at descending (reverse completion order)
+	stepOrder := make(map[string]int)
+	for idx, s := range orderedSteps {
+		stepOrder[s.ID] = idx
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].completedAt != candidates[j].completedAt {
+			return candidates[i].completedAt > candidates[j].completedAt
+		}
+		return stepOrder[candidates[i].step.ID] > stepOrder[candidates[j].step.ID]
+	})
+
+	// Find the first candidate that is not completed
+	var activeCompCandidate *compCandidate
+	allCompensated := true
+
+	for idx := range candidates {
+		c := &candidates[idx]
+		if c.state.Status == engine.StepCompensated {
+			continue
+		}
+		
+		allCompensated = false
+
+		if c.state.Status == engine.StepCompensationFailed {
+			// Compensation failed! Mark workflow as COMPENSATION_FAILED
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			_ = w.store.UpdateRunStatus(run.RunID, engine.StatusCompensationFailed, map[string]string{"failed_at": now})
+			_ = w.eng.AppendEvent(&store.Event{
+				RunID:        run.RunID,
+				WorkflowName: def.Name,
+				EventType:    engine.EventWorkflowCompensationFailed,
+				PayloadJSON:  fmt.Sprintf(`{"failed_step":%q,"error":%q}`, c.step.ID, c.state.LastError),
+			})
+			return
+		}
+
+		activeCompCandidate = c
+		break
+	}
+
+	if allCompensated {
+		// All candidate steps compensated! Mark run as COMPENSATED
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		_ = w.store.UpdateRunStatus(run.RunID, engine.StatusCompensated, map[string]string{"completed_at": now})
+		_ = w.eng.AppendEvent(&store.Event{
+			RunID:        run.RunID,
+			WorkflowName: def.Name,
+			EventType:    engine.EventWorkflowCompensationCompleted,
+			PayloadJSON:  "{}",
+		})
+		return
+	}
+
+	if activeCompCandidate == nil {
+		return
+	}
+
+	step := activeCompCandidate.step
+	st := activeCompCandidate.state
+
+	// Try to acquire lease
+	leaseDuration := 10 * time.Second
+	acquired, err := w.store.AcquireLease(run.RunID, step.ID, w.workerID, leaseDuration)
+	if err != nil || !acquired {
+		return
+	}
+
+	// Update step state status to COMPENSATING
+	st.Status = engine.StepCompensating
+	st.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	st.WorkerID = w.workerID
+	_ = w.store.UpsertStepState(st)
+
+	_ = w.eng.AppendEvent(&store.Event{
+		RunID:        run.RunID,
+		WorkflowName: def.Name,
+		EventType:    engine.EventStepCompensating,
+		StepID:       step.ID,
+		WorkerID:     w.workerID,
+		Attempt:      1,
+		PayloadJSON:  "{}",
+	})
+
+	// Launch execution
+	w.wg.Add(1)
+	go w.executeCompensation(run.RunID, def, step, st)
+}
+
+func (w *WorkerDaemon) executeCompensation(runID string, def *workflow.WorkflowDef, step workflow.StepDef, st *store.StepState) {
+	defer w.wg.Done()
+
+	jobKey := fmt.Sprintf("comp:%s:%s", runID, step.ID)
+	stopLeaseRenewal := make(chan struct{})
+	w.activeJobs.Store(jobKey, stopLeaseRenewal)
+	defer w.activeJobs.Delete(jobKey)
+
+	// Start Lease Renewal Loop
+	leaseDuration := 10 * time.Second
+	go w.leaseRenewalLoop(runID, step.ID, leaseDuration, stopLeaseRenewal)
+
+	// Execute compensation command using host executor
+	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+
+	fmt.Printf("Worker %s executing compensation step %s for run %s\n", w.workerID, step.ID, runID)
+
+	res, err := w.eng.ExecuteCompensationStep(ctx, runID, def, step)
+
+	close(stopLeaseRenewal)
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	st.Status = engine.StepCompensated
+	st.CompletedAt = now
+	st.WorkerID = w.workerID
+
+	if err != nil || (res != nil && res.ExitCode != 0) {
+		errStr := ""
+		if err != nil {
+			errStr = err.Error()
+		} else {
+			errStr = fmt.Sprintf("exit status %d", res.ExitCode)
+		}
+		fmt.Printf("Worker %s completed compensation step %s with error: %s\n", w.workerID, step.ID, errStr)
+
+		st.Status = engine.StepCompensationFailed
+		st.LastError = errStr
+		_ = w.store.UpsertStepState(st)
+
+		_ = w.eng.AppendEvent(&store.Event{
+			RunID:        runID,
+			WorkflowName: def.Name,
+			EventType:    engine.EventStepCompensationFailed,
+			StepID:       step.ID,
+			WorkerID:     w.workerID,
+			PayloadJSON:  fmt.Sprintf(`{"error":%q}`, errStr),
+		})
+	} else {
+		fmt.Printf("Worker %s successfully completed compensation step %s\n", w.workerID, step.ID)
+		_ = w.store.UpsertStepState(st)
+
+		_ = w.eng.AppendEvent(&store.Event{
+			RunID:        runID,
+			WorkflowName: def.Name,
+			EventType:    engine.EventStepCompensated,
+			StepID:       step.ID,
+			WorkerID:     w.workerID,
+			PayloadJSON:  "{}",
+		})
+	}
+
+	_ = w.store.ReleaseLease(runID, step.ID, w.workerID)
 }

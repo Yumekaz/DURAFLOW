@@ -1,0 +1,13 @@
+name: long-demo
+version: 1
+metadata:
+  description: "Designed for manual cancel/retry verification."
+steps:
+  - id: prepare
+    run: "echo 'Preparing...'"
+  - id: slow
+    run: "bash -c 'echo \"Starting slow work...\"; sleep 30; echo \"Finished slow work.\";'"
+    depends_on: ["prepare"]
+  - id: finalize
+    run: "echo 'Success finalization.'"
+    depends_on: ["slow"]

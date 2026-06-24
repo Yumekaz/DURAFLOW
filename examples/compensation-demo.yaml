@@ -1,0 +1,29 @@
+name: compensation-demo
+version: 1
+on_failure:
+  compensate: true
+metadata:
+  description: "Workflow demonstrating automatic rollback/compensation on failure."
+steps:
+  - id: build
+    run: "echo 'build succeeded'"
+    compensation:
+      run: "echo 'build rollback: cleaning up build artifacts'"
+  - id: backup
+    run: "echo 'backup succeeded'"
+    depends_on: ["build"]
+    compensation:
+      run: "echo 'backup rollback: removing remote backup'"
+  - id: migration
+    run: "echo 'migration succeeded'"
+    depends_on: ["backup"]
+    compensation:
+      run: "echo 'migration rollback: restoring database from backup'"
+  - id: start
+    run: "echo 'start succeeded'"
+    depends_on: ["migration"]
+    compensation:
+      run: "echo 'start rollback: stopping service'"
+  - id: healthcheck
+    run: "echo 'start failed healthcheck' && false"
+    depends_on: ["start"]

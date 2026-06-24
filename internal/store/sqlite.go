@@ -341,7 +341,7 @@ func (s *SQLiteStore) GetIncompleteRuns() ([]*WorkflowRun, error) {
 	query := `
 		SELECT run_id, workflow_name, workflow_version, status, created_at, started_at, completed_at, failed_at, metadata_json
 		FROM workflow_runs
-		WHERE status = 'RUNNING' OR status = 'CREATED'
+		WHERE status = 'RUNNING' OR status = 'CREATED' OR status = 'COMPENSATING'
 		ORDER BY created_at ASC;
 	`
 	rows, err := s.db.Query(query)
@@ -373,6 +373,75 @@ func (s *SQLiteStore) GetIncompleteRuns() ([]*WorkflowRun, error) {
 		runs = append(runs, &r)
 	}
 	return runs, nil
+}
+
+func (s *SQLiteStore) ResetStepState(runID, stepID string) error {
+	query := `
+		UPDATE step_states
+		SET status = 'PENDING', attempt = 0, last_error = NULL, completed_at = NULL, started_at = NULL, worker_id = NULL
+		WHERE run_id = ? AND step_id = ?;
+	`
+	_, err := s.db.Exec(query, runID, stepID)
+	if err != nil {
+		return fmt.Errorf("failed to reset step state: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) CancelWorkflowRun(runID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	res, err := tx.Exec(`
+		UPDATE workflow_runs
+		SET status = 'CANCELLED', failed_at = ?
+		WHERE run_id = ? AND (status = 'RUNNING' OR status = 'CREATED' OR status = 'COMPENSATING');
+	`, now, runID)
+	if err != nil {
+		return fmt.Errorf("failed to update run status for cancellation: %w", err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("workflow run not active or not found: %s", runID)
+	}
+
+	var name string
+	err = tx.QueryRow("SELECT workflow_name FROM workflow_runs WHERE run_id = ?", runID).Scan(&name)
+	if err != nil {
+		return fmt.Errorf("failed to fetch workflow name: %w", err)
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO events (run_id, workflow_name, event_type, payload_json)
+		VALUES (?, ?, 'WorkflowCancelled', '{}');
+	`, runID, name)
+	if err != nil {
+		return fmt.Errorf("failed to append cancellation event: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) ResetWorkflowRunForRetry(runID string, status string) error {
+	query := `
+		UPDATE workflow_runs
+		SET status = ?, failed_at = NULL, completed_at = NULL
+		WHERE run_id = ?;
+	`
+	_, err := s.db.Exec(query, status, runID)
+	if err != nil {
+		return fmt.Errorf("failed to reset workflow run for retry: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) RegisterWorker(w *Worker) error {
