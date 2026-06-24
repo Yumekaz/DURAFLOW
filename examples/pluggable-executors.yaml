@@ -1,0 +1,26 @@
+name: pluggable-executors-demo
+version: 1
+env:
+  GLOBAL_VAR: "global_value"
+steps:
+  - id: host-step
+    run: "echo 'Executing on host: global_var='$GLOBAL_VAR"
+    executor: "host"
+
+  - id: docker-step
+    run: "echo 'Executing in Docker: global_var='$GLOBAL_VAR"
+    executor: "docker"
+    image: "alpine:latest"
+    cpu: "0.5"
+    memory: "128m"
+    depends_on:
+      - host-step
+
+  - id: mini-docker-step
+    run: "echo 'Executing in Mini-Docker: global_var='$GLOBAL_VAR"
+    executor: "mini-docker"
+    image: "/home/yumekaz/Desktop/Mini-Docker/rootfs"
+    cpu: "50"
+    memory: "64M"
+    depends_on:
+      - docker-step

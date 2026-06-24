@@ -24,6 +24,10 @@ type StepDef struct {
 	IdempotencyKey string       `yaml:"idempotency_key"`
 	Compensation   *CompStep    `yaml:"compensation"`
 	Wait           *WaitDef     `yaml:"wait"`
+	Executor       string       `yaml:"executor"`
+	Image          string       `yaml:"image"`
+	CPU            string       `yaml:"cpu"`
+	Memory         string       `yaml:"memory"`
 }
 
 type WaitDef struct {

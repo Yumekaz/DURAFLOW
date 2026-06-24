@@ -3,32 +3,47 @@ package executor
 import (
 	"bytes"
 	"context"
-	"os"
+	"fmt"
 	"os/exec"
 	"syscall"
 	"time"
 )
 
-type HostExecutor struct{}
+type DockerExecutor struct{}
 
-func NewHostExecutor() *HostExecutor {
-	return &HostExecutor{}
+func NewDockerExecutor() *DockerExecutor {
+	return &DockerExecutor{}
 }
 
-func (h *HostExecutor) Execute(ctx context.Context, req ExecutionRequest) (*Result, error) {
+func (d *DockerExecutor) Execute(ctx context.Context, req ExecutionRequest) (*Result, error) {
 	start := time.Now()
 
-	// Use standard exec.Command without context so we can manage termination ourselves
-	cmd := exec.Command("sh", "-c", req.Command)
-	
-	// Create a new process group for the command on Unix-like systems
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	// Set up environment variables
-	cmd.Env = os.Environ() // Start with current environment
-	for k, v := range req.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+	if req.Image == "" {
+		return nil, fmt.Errorf("docker executor requires a non-empty container image")
 	}
+
+	args := []string{"run", "--rm", "-i"}
+
+	// Environment variables
+	for k, v := range req.Env {
+		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+	}
+
+	// CPU limit (e.g. "0.5")
+	if req.CPU != "" {
+		args = append(args, fmt.Sprintf("--cpus=%s", req.CPU))
+	}
+
+	// Memory limit (e.g. "256m")
+	if req.Memory != "" {
+		args = append(args, "-m", req.Memory)
+	}
+
+	// Add image and shell command
+	args = append(args, req.Image, "sh", "-c", req.Command)
+
+	cmd := exec.Command("docker", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -42,14 +57,13 @@ func (h *HostExecutor) Execute(ctx context.Context, req ExecutionRequest) (*Resu
 		}, nil
 	}
 
-	// Monitor context cancellation in the background
 	doneChan := make(chan struct{})
 	defer close(doneChan)
 
 	go func() {
 		select {
 		case <-ctx.Done():
-			// Kill the entire process group (-PID)
+			// Kill the process group to abort the docker run command
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		case <-doneChan:
 		}
@@ -58,12 +72,11 @@ func (h *HostExecutor) Execute(ctx context.Context, req ExecutionRequest) (*Resu
 	err := cmd.Wait()
 	duration := time.Since(start)
 
-	// Check if context was cancelled or timed out
 	if ctx.Err() != nil {
 		return &Result{
 			ExitCode: -1,
 			Stdout:   stdoutBuf.String(),
-			Stderr:   stderrBuf.String() + "\n[DURAFLOW] Command execution timed out or was canceled",
+			Stderr:   stderrBuf.String() + "\n[DOCKER] Container execution timed out or was canceled",
 			Duration: duration,
 			Error:    ctx.Err(),
 		}, nil
@@ -84,10 +97,15 @@ func (h *HostExecutor) Execute(ctx context.Context, req ExecutionRequest) (*Resu
 		}
 	}
 
+	stderrStr := stderrBuf.String()
+	if stderrStr != "" {
+		stderrStr = "[DOCKER] " + stderrStr
+	}
+
 	return &Result{
 		ExitCode: exitCode,
 		Stdout:   stdoutBuf.String(),
-		Stderr:   stderrBuf.String(),
+		Stderr:   stderrStr,
 		Duration: duration,
 		Error:    execErr,
 	}, nil

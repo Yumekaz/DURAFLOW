@@ -9,7 +9,9 @@ import (
 
 func TestHostExecutor_Success(t *testing.T) {
 	exec := NewHostExecutor()
-	res, err := exec.Execute(context.Background(), "echo 'hello'", nil)
+	res, err := exec.Execute(context.Background(), ExecutionRequest{
+		Command: "echo 'hello'",
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -33,7 +35,9 @@ func TestHostExecutor_Success(t *testing.T) {
 
 func TestHostExecutor_Failure(t *testing.T) {
 	exec := NewHostExecutor()
-	res, err := exec.Execute(context.Background(), "echo 'failed step' >&2; exit 42", nil)
+	res, err := exec.Execute(context.Background(), ExecutionRequest{
+		Command: "echo 'failed step' >&2; exit 42",
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -49,8 +53,11 @@ func TestHostExecutor_Failure(t *testing.T) {
 
 func TestHostExecutor_Env(t *testing.T) {
 	exec := NewHostExecutor()
-	res, err := exec.Execute(context.Background(), "echo $TEST_VAR", map[string]string{
-		"TEST_VAR": "env_value_123",
+	res, err := exec.Execute(context.Background(), ExecutionRequest{
+		Command: "echo $TEST_VAR",
+		Env: map[string]string{
+			"TEST_VAR": "env_value_123",
+		},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -70,7 +77,9 @@ func TestHostExecutor_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	res, err := exec.Execute(ctx, "sleep 2", nil)
+	res, err := exec.Execute(ctx, ExecutionRequest{
+		Command: "sleep 2",
+	})
 	if err != nil {
 		t.Fatalf("unexpected execution error: %v", err)
 	}

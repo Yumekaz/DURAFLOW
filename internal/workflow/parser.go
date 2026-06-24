@@ -83,6 +83,17 @@ func ParseAndValidate(data []byte) (*WorkflowDef, string, []StepDef, error) {
 				step.Retry.Backoff = "fixed"
 			}
 		}
+		// Normalize executor settings
+		if step.Executor == "" {
+			step.Executor = "host"
+		}
+		if step.Executor != "host" && step.Executor != "docker" && step.Executor != "mini-docker" {
+			return nil, "", nil, fmt.Errorf("step %q has invalid executor %q: must be 'host', 'docker', or 'mini-docker'", step.ID, step.Executor)
+		}
+		if (step.Executor == "docker" || step.Executor == "mini-docker") && step.Image == "" {
+			return nil, "", nil, fmt.Errorf("step %q specifies executor %q but does not provide an image", step.ID, step.Executor)
+		}
+
 		def.Steps[i] = step
 		stepMap[step.ID] = step
 	}

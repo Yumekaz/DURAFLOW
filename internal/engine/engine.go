@@ -471,7 +471,17 @@ func (e *WorkflowEngine) executeStep(ctx context.Context, runID string, def *wor
 	stepEnv["DURAFLOW_STEP_ID"] = step.ID
 	stepEnv["DURAFLOW_ATTEMPT"] = fmt.Sprintf("%d", attempt)
 
-	return e.executor.Execute(stepCtx, step.Run, stepEnv)
+	req := executor.ExecutionRequest{
+		Executor:  step.Executor,
+		Command:   step.Run,
+		Env:       stepEnv,
+		Image:     step.Image,
+		CPU:       step.CPU,
+		Memory:    step.Memory,
+		TimeoutMs: step.TimeoutMs,
+	}
+
+	return e.executor.Execute(stepCtx, req)
 }
 
 func isRetryable(policy *workflow.RetryPolicy, exitCode int) bool {
@@ -511,5 +521,15 @@ func (e *WorkflowEngine) ExecuteCompensationStep(ctx context.Context, runID stri
 	stepEnv["DURAFLOW_RUN_ID"] = runID
 	stepEnv["DURAFLOW_STEP_ID"] = step.ID
 
-	return e.executor.Execute(ctx, step.Compensation.Run, stepEnv)
+	req := executor.ExecutionRequest{
+		Executor:  step.Executor,
+		Command:   step.Compensation.Run,
+		Env:       stepEnv,
+		Image:     step.Image,
+		CPU:       step.CPU,
+		Memory:    step.Memory,
+		TimeoutMs: step.TimeoutMs,
+	}
+
+	return e.executor.Execute(ctx, req)
 }

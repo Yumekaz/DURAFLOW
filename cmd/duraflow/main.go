@@ -62,6 +62,14 @@ func getStore() (store.EventStore, error) {
 	return s, nil
 }
 
+func getExecutor() executor.Executor {
+	reg := executor.NewRegistry()
+	reg.Register("host", executor.NewHostExecutor())
+	reg.Register("docker", executor.NewDockerExecutor())
+	reg.Register("mini-docker", executor.NewMiniDockerExecutor())
+	return reg
+}
+
 func resolveDBPath(path string) string {
 	if strings.HasPrefix(path, "~") {
 		home, err := os.UserHomeDir()
@@ -99,7 +107,7 @@ func runCmd() *cobra.Command {
 			}
 			defer s.Close()
 
-			exec := executor.NewHostExecutor()
+			exec := getExecutor()
 			eng := engine.NewWorkflowEngine(s, exec)
 
 			if def.Schedule != nil {
@@ -610,7 +618,7 @@ func resumeCmd() *cobra.Command {
 				}
 			}
 
-			exec := executor.NewHostExecutor()
+			exec := getExecutor()
 			eng := engine.NewWorkflowEngine(s, exec)
 
 			for idx, runID := range runsToResume {
@@ -849,7 +857,7 @@ func workerStartCmd() *cobra.Command {
 			}
 			defer s.Close()
 
-			exec := executor.NewHostExecutor()
+			exec := getExecutor()
 			eng := engine.NewWorkflowEngine(s, exec)
 
 			w := worker.NewWorkerDaemon(s, eng)
@@ -1084,7 +1092,7 @@ func serverCmd() *cobra.Command {
 			}
 			defer s.Close()
 
-			exec := executor.NewHostExecutor()
+			exec := getExecutor()
 			eng := engine.NewWorkflowEngine(s, exec)
 
 			bindAddr := addr
