@@ -70,6 +70,26 @@ type Lease struct {
 	Status    string
 }
 
+type Timer struct {
+	TimerID     string
+	RunID       string
+	StepID      string
+	FireAt      string
+	Status      string // "PENDING" | "FIRED" | "CANCELLED"
+	PayloadJSON string
+}
+
+type CronSchedule struct {
+	WorkflowName   string
+	CronExpression string
+	OverlapPolicy  string // "skip" | "allow"
+	LastRunID      string
+	LastRunTime    string
+	NextRunTime    string
+	DefinitionYAML string
+	Status         string // "ACTIVE" | "PAUSED"
+}
+
 type EventStore interface {
 	Init() error
 	Close() error
@@ -107,4 +127,17 @@ type EventStore interface {
 	AcquireLease(runID, stepID, workerID string, duration time.Duration) (bool, error)
 	RenewLease(runID, stepID, workerID string, duration time.Duration) (bool, error)
 	ReleaseLease(runID, stepID, workerID string) error
+
+	// Timers
+	CreateTimer(t *Timer) error
+	GetTimer(runID, stepID string) (*Timer, error)
+	FireTimer(timerID string) error
+	CancelTimer(timerID string) error
+
+	// Cron Schedules
+	UpsertCronSchedule(cs *CronSchedule) error
+	GetDueCronSchedules(nowStr string) ([]*CronSchedule, error)
+	UpdateCronScheduleNextRun(workflowName, lastRunID, lastRunTime, nextRunTime string) error
+	ListCronSchedules() ([]*CronSchedule, error)
+	TriggerCronSchedule(workflowName string, now time.Time) (string, bool, error)
 }

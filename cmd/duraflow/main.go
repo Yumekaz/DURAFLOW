@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	"github.com/spf13/cobra"
 	"github.com/yumekaz/duraflow/internal/engine"
 	"github.com/yumekaz/duraflow/internal/executor"
@@ -39,6 +40,7 @@ func main() {
 	rootCmd.AddCommand(logsCmd())
 	rootCmd.AddCommand(resumeCmd())
 	rootCmd.AddCommand(workerCmd())
+	rootCmd.AddCommand(cronCmd())
 	rootCmd.AddCommand(versionCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -95,6 +97,44 @@ func runCmd() *cobra.Command {
 
 			exec := executor.NewHostExecutor()
 			eng := engine.NewWorkflowEngine(s, exec)
+
+			if def.Schedule != nil {
+				if err := s.RegisterWorkflow(def, hash, string(data)); err != nil {
+					return fmt.Errorf("failed to register workflow definition: %w", err)
+				}
+
+				parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+				sched, err := parser.Parse(def.Schedule.Cron)
+				if err != nil {
+					return fmt.Errorf("invalid cron expression %q: %w", def.Schedule.Cron, err)
+				}
+				nextRunTime := sched.Next(time.Now().UTC()).Format(time.RFC3339Nano)
+
+				err = s.UpsertCronSchedule(&store.CronSchedule{
+					WorkflowName:   def.Name,
+					CronExpression: def.Schedule.Cron,
+					OverlapPolicy:  def.Schedule.Overlap,
+					NextRunTime:    nextRunTime,
+					DefinitionYAML: string(data),
+					Status:         "ACTIVE",
+				})
+				if err != nil {
+					return fmt.Errorf("failed to register cron schedule: %w", err)
+				}
+
+				_ = s.AppendEvent(&store.Event{
+					RunID:        "",
+					WorkflowName: def.Name,
+					EventType:    "CronScheduleRegistered",
+					PayloadJSON:  fmt.Sprintf(`{"cron_expression":%q,"overlap_policy":%q}`, def.Schedule.Cron, def.Schedule.Overlap),
+				})
+
+				fmt.Printf("Cron schedule registered for workflow %q.\n", def.Name)
+				fmt.Printf("  Expression:  %s\n", def.Schedule.Cron)
+				fmt.Printf("  Overlap:     %s\n", def.Schedule.Overlap)
+				fmt.Printf("  Next Run:    %s\n", formatTime(nextRunTime))
+				return nil
+			}
 
 			fmt.Printf("Starting workflow %q...\n", def.Name)
 			runID, err := eng.RunWorkflow(context.Background(), def, orderedSteps, hash, string(data))
@@ -722,6 +762,56 @@ func workerStartCmd() *cobra.Command {
 			fmt.Println("\nShutting down worker daemon gracefully...")
 			w.Stop()
 			fmt.Println("Worker daemon stopped.")
+			return nil
+		},
+	}
+}
+
+func cronCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "cron",
+		Short: "Manage registered cron workflow schedules",
+	}
+	cmd.AddCommand(cronListCmd())
+	return cmd
+}
+
+func cronListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List all active cron schedules",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := getStore()
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+
+			schedules, err := s.ListCronSchedules()
+			if err != nil {
+				return err
+			}
+
+			if len(schedules) == 0 {
+				fmt.Println("No active cron schedules found.")
+				return nil
+			}
+
+			fmt.Printf("%-20s %-15s %-10s %-38s %-25s %-25s\n", "WORKFLOW", "CRON", "OVERLAP", "LAST RUN ID", "LAST RUN TIME", "NEXT RUN TIME")
+			fmt.Println(strings.Repeat("-", 138))
+			for _, cs := range schedules {
+				lastRunID := cs.LastRunID
+				if lastRunID == "" {
+					lastRunID = "-"
+				}
+				lastRunTime := "-"
+				if cs.LastRunTime != "" {
+					lastRunTime = formatTime(cs.LastRunTime)
+				}
+				nextRunTime := formatTime(cs.NextRunTime)
+
+				fmt.Printf("%-20s %-15s %-10s %-38s %-25s %-25s\n", cs.WorkflowName, cs.CronExpression, cs.OverlapPolicy, lastRunID, lastRunTime, nextRunTime)
+			}
 			return nil
 		},
 	}

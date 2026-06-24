@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
 	_ "modernc.org/sqlite"
 	"github.com/yumekaz/duraflow/internal/workflow"
 	"gopkg.in/yaml.v3"
@@ -566,6 +568,303 @@ func (s *SQLiteStore) ReleaseLease(runID, stepID, workerID string) error {
 		return fmt.Errorf("failed to release lease: %w", err)
 	}
 	return nil
+}
+
+func (s *SQLiteStore) CreateTimer(t *Timer) error {
+	query := `
+		INSERT INTO timers (timer_id, run_id, step_id, fire_at, status, payload_json)
+		VALUES (?, ?, ?, ?, 'PENDING', ?)
+		ON CONFLICT(timer_id) DO UPDATE SET
+			fire_at = excluded.fire_at,
+			status = 'PENDING',
+			payload_json = excluded.payload_json;
+	`
+	if t.PayloadJSON == "" {
+		t.PayloadJSON = "{}"
+	}
+	_, err := s.db.Exec(query, t.TimerID, t.RunID, t.StepID, t.FireAt, t.PayloadJSON)
+	if err != nil {
+		return fmt.Errorf("failed to create timer: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetTimer(runID, stepID string) (*Timer, error) {
+	query := `
+		SELECT timer_id, run_id, step_id, fire_at, status, payload_json
+		FROM timers
+		WHERE run_id = ? AND step_id = ?;
+	`
+	var t Timer
+	err := s.db.QueryRow(query, runID, stepID).Scan(&t.TimerID, &t.RunID, &t.StepID, &t.FireAt, &t.Status, &t.PayloadJSON)
+	if err == sql.ErrNoRows {
+		return nil, nil // not found
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to get timer: %w", err)
+	}
+	return &t, nil
+}
+
+func (s *SQLiteStore) FireTimer(timerID string) error {
+	query := `
+		UPDATE timers SET status = 'FIRED'
+		WHERE timer_id = ? AND status = 'PENDING';
+	`
+	_, err := s.db.Exec(query, timerID)
+	if err != nil {
+		return fmt.Errorf("failed to fire timer: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) CancelTimer(timerID string) error {
+	query := `
+		UPDATE timers SET status = 'CANCELLED'
+		WHERE timer_id = ? AND status = 'PENDING';
+	`
+	_, err := s.db.Exec(query, timerID)
+	if err != nil {
+		return fmt.Errorf("failed to cancel timer: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) UpsertCronSchedule(cs *CronSchedule) error {
+	query := `
+		INSERT INTO cron_schedules (workflow_name, cron_expression, overlap_policy, last_run_id, last_run_time, next_run_time, definition_yaml, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(workflow_name) DO UPDATE SET
+			cron_expression = excluded.cron_expression,
+			overlap_policy = excluded.overlap_policy,
+			next_run_time = excluded.next_run_time,
+			definition_yaml = excluded.definition_yaml,
+			status = excluded.status;
+	`
+	var lastRunID, lastRunTime interface{}
+	if cs.LastRunID != "" {
+		lastRunID = cs.LastRunID
+	}
+	if cs.LastRunTime != "" {
+		lastRunTime = cs.LastRunTime
+	}
+	_, err := s.db.Exec(query, cs.WorkflowName, cs.CronExpression, cs.OverlapPolicy, lastRunID, lastRunTime, cs.NextRunTime, cs.DefinitionYAML, cs.Status)
+	if err != nil {
+		return fmt.Errorf("failed to upsert cron schedule: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetDueCronSchedules(nowStr string) ([]*CronSchedule, error) {
+	query := `
+		SELECT workflow_name, cron_expression, overlap_policy, COALESCE(last_run_id, ''), COALESCE(last_run_time, ''), next_run_time, definition_yaml, status
+		FROM cron_schedules
+		WHERE status = 'ACTIVE' AND next_run_time <= ?;
+	`
+	rows, err := s.db.Query(query, nowStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query due cron schedules: %w", err)
+	}
+	defer rows.Close()
+
+	var schedules []*CronSchedule
+	for rows.Next() {
+		var cs CronSchedule
+		err := rows.Scan(&cs.WorkflowName, &cs.CronExpression, &cs.OverlapPolicy, &cs.LastRunID, &cs.LastRunTime, &cs.NextRunTime, &cs.DefinitionYAML, &cs.Status)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan cron schedule: %w", err)
+		}
+		schedules = append(schedules, &cs)
+	}
+	return schedules, nil
+}
+
+func (s *SQLiteStore) UpdateCronScheduleNextRun(workflowName, lastRunID, lastRunTime, nextRunTime string) error {
+	query := `
+		UPDATE cron_schedules
+		SET last_run_id = ?, last_run_time = ?, next_run_time = ?
+		WHERE workflow_name = ?;
+	`
+	_, err := s.db.Exec(query, lastRunID, lastRunTime, nextRunTime, workflowName)
+	if err != nil {
+		return fmt.Errorf("failed to update cron next run: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListCronSchedules() ([]*CronSchedule, error) {
+	query := `
+		SELECT workflow_name, cron_expression, overlap_policy, COALESCE(last_run_id, ''), COALESCE(last_run_time, ''), next_run_time, definition_yaml, status
+		FROM cron_schedules
+		ORDER BY workflow_name ASC;
+	`
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list cron schedules: %w", err)
+	}
+	defer rows.Close()
+
+	var schedules []*CronSchedule
+	for rows.Next() {
+		var cs CronSchedule
+		err := rows.Scan(&cs.WorkflowName, &cs.CronExpression, &cs.OverlapPolicy, &cs.LastRunID, &cs.LastRunTime, &cs.NextRunTime, &cs.DefinitionYAML, &cs.Status)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan cron schedule: %w", err)
+		}
+		schedules = append(schedules, &cs)
+	}
+	return schedules, nil
+}
+
+func (s *SQLiteStore) TriggerCronSchedule(workflowName string, now time.Time) (string, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", false, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Query the cron schedule
+	query := `
+		SELECT cron_expression, overlap_policy, COALESCE(last_run_id, ''), next_run_time, definition_yaml, status
+		FROM cron_schedules
+		WHERE workflow_name = ?;
+	`
+	var cronExpr, overlapPolicy, lastRunID, nextRunTimeStr, definitionYAML, status string
+	err = tx.QueryRow(query, workflowName).Scan(&cronExpr, &overlapPolicy, &lastRunID, &nextRunTimeStr, &definitionYAML, &status)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	} else if err != nil {
+		return "", false, fmt.Errorf("failed to query cron schedule: %w", err)
+	}
+
+	if status != "ACTIVE" {
+		return "", false, nil
+	}
+
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+	if nextRunTimeStr > nowStr {
+		return "", false, nil // not due yet
+	}
+
+	// Parse cron expression to calculate the next execution time
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	sched, err := parser.Parse(cronExpr)
+	if err != nil {
+		return "", false, fmt.Errorf("invalid cron expression %q: %w", cronExpr, err)
+	}
+	nextRunTime := sched.Next(now).UTC().Format(time.RFC3339Nano)
+
+	// Parse definition to get name, version, and steps
+	var def workflow.WorkflowDef
+	if err := yaml.Unmarshal([]byte(definitionYAML), &def); err != nil {
+		return "", false, fmt.Errorf("failed to parse yaml: %w", err)
+	}
+
+	// Check overlap policy if skip
+	if overlapPolicy == "skip" && lastRunID != "" {
+		// Check status of last run
+		var lastStatus string
+		err = tx.QueryRow("SELECT status FROM workflow_runs WHERE run_id = ?", lastRunID).Scan(&lastStatus)
+		if err == nil && (lastStatus == "RUNNING" || lastStatus == "CREATED") {
+			// Skip triggering! Just update next_run_time
+			updateQuery := `
+				UPDATE cron_schedules
+				SET next_run_time = ?
+				WHERE workflow_name = ?;
+			`
+			_, err = tx.Exec(updateQuery, nextRunTime, workflowName)
+			if err != nil {
+				return "", false, fmt.Errorf("failed to update cron next_run_time on skip: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return "", false, fmt.Errorf("failed to commit skip: %w", err)
+			}
+			return "", false, nil
+		}
+	}
+
+	// Calculate hash and ordered steps for RunWorkflow preparation
+	_, _, orderedSteps, err := workflow.ParseAndValidate([]byte(definitionYAML))
+	if err != nil {
+		return "", false, fmt.Errorf("failed to parse/validate: %w", err)
+	}
+
+	// Trigger run:
+	runID := uuid.New().String()
+	
+	// 1. Create run record
+	insertRun := `
+		INSERT INTO workflow_runs (run_id, workflow_name, workflow_version, status, created_at, metadata_json)
+		VALUES (?, ?, ?, 'CREATED', ?, '{}');
+	`
+	_, err = tx.Exec(insertRun, runID, def.Name, def.Version, nowStr)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to create run: %w", err)
+	}
+
+	// 2. Append events: WorkflowRunCreated and CronWorkflowTriggered
+	insertEvent := `
+		INSERT INTO events (run_id, workflow_name, event_type, payload_json)
+		VALUES (?, ?, ?, ?);
+	`
+	_, err = tx.Exec(insertEvent, runID, def.Name, "WorkflowRunCreated", "{}")
+	if err != nil {
+		return "", false, fmt.Errorf("failed to append run created event: %w", err)
+	}
+
+	payloadJSON := fmt.Sprintf(`{"cron_expression":%q,"overlap_policy":%q}`, cronExpr, overlapPolicy)
+	_, err = tx.Exec(insertEvent, runID, def.Name, "CronWorkflowTriggered", payloadJSON)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to append cron triggered event: %w", err)
+	}
+
+	// 3. Initialize step states to PENDING
+	insertStepState := `
+		INSERT INTO step_states (run_id, step_id, status, attempt, max_attempts)
+		VALUES (?, ?, 'PENDING', 0, ?);
+	`
+	for _, step := range orderedSteps {
+		maxAttempts := step.Retry.MaxAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = 1
+		}
+		_, err = tx.Exec(insertStepState, runID, step.ID, maxAttempts)
+		if err != nil {
+			return "", false, fmt.Errorf("failed to init step state: %w", err)
+		}
+	}
+
+	// 4. Update workflow run status to RUNNING
+	updateRunStatus := `
+		UPDATE workflow_runs
+		SET status = 'RUNNING', started_at = ?
+		WHERE run_id = ?;
+	`
+	_, err = tx.Exec(updateRunStatus, nowStr, runID)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to start run: %w", err)
+	}
+
+	_, err = tx.Exec(insertEvent, runID, def.Name, "WorkflowStarted", "{}")
+	if err != nil {
+		return "", false, fmt.Errorf("failed to append started event: %w", err)
+	}
+
+	// 5. Update cron schedule table with last run details
+	updateCron := `
+		UPDATE cron_schedules
+		SET last_run_id = ?, last_run_time = ?, next_run_time = ?
+		WHERE workflow_name = ?;
+	`
+	_, err = tx.Exec(updateCron, runID, nowStr, nextRunTime, workflowName)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to update cron schedule: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", false, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return runID, true, nil
 }
 
 

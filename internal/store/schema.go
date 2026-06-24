@@ -93,4 +93,32 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_leases_worker ON leases(worker_id);
+
+-- Durable Timers
+CREATE TABLE IF NOT EXISTS timers (
+    timer_id     TEXT PRIMARY KEY,
+    run_id       TEXT NOT NULL,
+    step_id      TEXT NOT NULL,
+    fire_at      TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING' | 'FIRED' | 'CANCELLED'
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(run_id) REFERENCES workflow_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_timers_fire_at ON timers(fire_at) WHERE status = 'PENDING';
+
+-- Cron Schedules
+CREATE TABLE IF NOT EXISTS cron_schedules (
+    workflow_name     TEXT PRIMARY KEY,
+    cron_expression   TEXT NOT NULL,
+    overlap_policy    TEXT NOT NULL DEFAULT 'skip', -- 'skip' | 'allow'
+    last_run_id       TEXT,
+    last_run_time     TEXT,
+    next_run_time     TEXT NOT NULL,
+    definition_yaml   TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'ACTIVE',
+    FOREIGN KEY(last_run_id) REFERENCES workflow_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cron_schedules_next_run_time ON cron_schedules(next_run_time) WHERE status = 'ACTIVE';
 `

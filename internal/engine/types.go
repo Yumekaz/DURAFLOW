@@ -17,6 +17,7 @@ const (
 	StepRetryScheduled = "RETRY_SCHEDULED"
 	StepTimedOut       = "TIMED_OUT"
 	StepFailedFinal    = "FAILED_FINAL"
+	StepWaiting        = "WAITING"
 )
 
 // Event types
@@ -34,4 +35,9 @@ const (
 	EventStepFailedFinal    = "StepFailedFinal"
 	EventWorkflowResumed    = "WorkflowResumed"
 	EventStepResumed        = "StepResumed"
+	EventTimerCreated       = "TimerCreated"
+	EventTimerFired         = "TimerFired"
+	EventTimerCancelled     = "TimerCancelled"
+	EventCronScheduleReg    = "CronScheduleRegistered"
+	EventCronWorkflowTrig   = "CronWorkflowTriggered"
 )

@@ -34,6 +34,10 @@ func (e *WorkflowEngine) appendEvent(event *store.Event) error {
 	return nil
 }
 
+func (e *WorkflowEngine) AppendEvent(event *store.Event) error {
+	return e.appendEvent(event)
+}
+
 func (e *WorkflowEngine) RunWorkflow(ctx context.Context, def *workflow.WorkflowDef, orderedSteps []workflow.StepDef, hash string, yamlContent string) (string, error) {
 	runID := uuid.New().String()
 
@@ -180,8 +184,17 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 		return fmt.Errorf("failed to append step started event: %w", err)
 	}
 
-	// 2. Execute the command
-	res, execErr := e.executeStep(ctx, runID, def, step, attempt)
+	var res *executor.Result
+	var execErr error
+	if step.Wait != nil {
+		res = &executor.Result{
+			ExitCode: 0,
+			Stdout:   "",
+			Stderr:   "",
+		}
+	} else {
+		res, execErr = e.executeStep(ctx, runID, def, step, attempt)
+	}
 
 	// Determine if it was a step timeout (deadline exceeded but parent context not cancelled)
 	isTimeout := false

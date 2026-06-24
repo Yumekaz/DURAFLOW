@@ -1,0 +1,10 @@
+name: cron-demo
+version: 1
+schedule:
+  cron: "*/1 * * * *"
+  overlap: "skip"
+metadata:
+  description: "Workflow scheduled to run every minute."
+steps:
+  - id: step-1
+    run: "echo 'Cron workflow executed at' && date -u"

@@ -4,6 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"time"
+
+	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,7 +30,24 @@ func ParseAndValidate(data []byte) (*WorkflowDef, string, []StepDef, error) {
 		return nil, "", nil, fmt.Errorf("workflow must have at least one step")
 	}
 
-	// 3. Validate step uniqueness and non-emptiness
+	// Validate Schedule block if present
+	if def.Schedule != nil {
+		if def.Schedule.Cron == "" {
+			return nil, "", nil, fmt.Errorf("schedule cron expression cannot be empty")
+		}
+		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		if _, err := parser.Parse(def.Schedule.Cron); err != nil {
+			return nil, "", nil, fmt.Errorf("invalid cron expression %q: %w", def.Schedule.Cron, err)
+		}
+		if def.Schedule.Overlap == "" {
+			def.Schedule.Overlap = "skip"
+		}
+		if def.Schedule.Overlap != "skip" && def.Schedule.Overlap != "allow" {
+			return nil, "", nil, fmt.Errorf("invalid overlap policy %q: must be 'skip' or 'allow'", def.Schedule.Overlap)
+		}
+	}
+
+	// 3. Validate step uniqueness, non-emptiness, and run/wait definitions
 	stepMap := make(map[string]StepDef)
 	for i, step := range def.Steps {
 		if step.ID == "" {
@@ -35,6 +55,20 @@ func ParseAndValidate(data []byte) (*WorkflowDef, string, []StepDef, error) {
 		}
 		if _, exists := stepMap[step.ID]; exists {
 			return nil, "", nil, fmt.Errorf("duplicate step ID: %s", step.ID)
+		}
+		if step.Run == "" && step.Wait == nil {
+			return nil, "", nil, fmt.Errorf("step %q must specify either 'run' or 'wait'", step.ID)
+		}
+		if step.Run != "" && step.Wait != nil {
+			return nil, "", nil, fmt.Errorf("step %q cannot specify both 'run' and 'wait'", step.ID)
+		}
+		if step.Wait != nil {
+			if step.Wait.Duration == "" {
+				return nil, "", nil, fmt.Errorf("step %q wait duration cannot be empty", step.ID)
+			}
+			if _, err := time.ParseDuration(step.Wait.Duration); err != nil {
+				return nil, "", nil, fmt.Errorf("step %q invalid wait duration %q: %w", step.ID, step.Wait.Duration, err)
+			}
 		}
 		// Normalize retry policies
 		if step.Retry == nil {

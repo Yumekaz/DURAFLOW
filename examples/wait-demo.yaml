@@ -1,0 +1,14 @@
+name: wait-demo
+version: 1
+metadata:
+  description: "Workflow demonstrating durable wait steps."
+steps:
+  - id: start
+    run: "echo 'Starting wait demo at' && date -u"
+  - id: wait-step
+    wait:
+      duration: "5s"
+    depends_on: ["start"]
+  - id: end
+    run: "echo 'Ended wait demo at' && date -u"
+    depends_on: ["wait-step"]

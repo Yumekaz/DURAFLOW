@@ -356,4 +356,116 @@ func TestSQLiteStore_WorkersAndLeases(t *testing.T) {
 	}
 }
 
+func TestTimersAndCronSchedules(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "duraflow-store-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	store := NewSQLiteStore(dbPath)
+
+	if err := store.Init(); err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Timers
+	// Create workflow run first to satisfy foreign key constraint
+	run := &WorkflowRun{
+		RunID:           "run-1",
+		WorkflowName:    "test-workflow",
+		WorkflowVersion: 1,
+		Status:          "CREATED",
+		MetadataJSON:    "{}",
+	}
+	if err := store.CreateRun(run); err != nil {
+		t.Fatalf("failed to create run: %v", err)
+	}
+
+	timer := &Timer{
+		TimerID:     "t-1",
+		RunID:       "run-1",
+		StepID:      "step-1",
+		FireAt:      time.Now().Add(5 * time.Second).UTC().Format(time.RFC3339Nano),
+		Status:      "PENDING",
+		PayloadJSON: "{}",
+	}
+
+	if err := store.CreateTimer(timer); err != nil {
+		t.Fatalf("failed to create timer: %v", err)
+	}
+
+	got, err := store.GetTimer("run-1", "step-1")
+	if err != nil {
+		t.Fatalf("failed to get timer: %v", err)
+	}
+	if got == nil || got.TimerID != "t-1" || got.Status != "PENDING" {
+		t.Errorf("expected timer t-1 in status PENDING, got: %+v", got)
+	}
+
+	if err := store.FireTimer("t-1"); err != nil {
+		t.Fatalf("failed to fire timer: %v", err)
+	}
+	got, _ = store.GetTimer("run-1", "step-1")
+	if got.Status != "FIRED" {
+		t.Errorf("expected timer to be FIRED, got: %s", got.Status)
+	}
+
+	// 2. Cron Schedules
+	cs := &CronSchedule{
+		WorkflowName:   "cron-workflow",
+		CronExpression: "*/5 * * * *",
+		OverlapPolicy:  "skip",
+		NextRunTime:    time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339Nano),
+		DefinitionYAML: `
+name: cron-workflow
+version: 1
+steps:
+  - id: step-1
+    run: "echo 'hello'"
+`,
+		Status:         "ACTIVE",
+	}
+
+	if err := store.UpsertCronSchedule(cs); err != nil {
+		t.Fatalf("failed to upsert cron schedule: %v", err)
+	}
+
+	list, err := store.ListCronSchedules()
+	if err != nil || len(list) != 1 || list[0].WorkflowName != "cron-workflow" {
+		t.Errorf("failed to list cron schedules: %v, list: %+v", err, list)
+	}
+
+	due, err := store.GetDueCronSchedules(time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil || len(due) != 1 {
+		t.Errorf("expected 1 due cron schedule, got %d, err: %v", len(due), err)
+	}
+
+	// Trigger cron schedule (first trigger should create the run)
+	runID, triggered, err := store.TriggerCronSchedule("cron-workflow", time.Now())
+	if err != nil {
+		t.Fatalf("failed to trigger cron: %v", err)
+	}
+	if !triggered || runID == "" {
+		t.Errorf("expected cron to trigger successfully")
+	}
+
+	// Double check the run is created in running status
+	run, err = store.GetRun(runID)
+	if err != nil || run.Status != "RUNNING" {
+		t.Errorf("expected run to be RUNNING, got status: %s, err: %v", run.Status, err)
+	}
+
+	// Trigger again immediately (overlap policy is skip, run is still RUNNING, so it should skip!)
+	_, triggered, err = store.TriggerCronSchedule("cron-workflow", time.Now())
+	if err != nil {
+		t.Fatalf("failed to trigger cron second time: %v", err)
+	}
+	if triggered {
+		t.Errorf("expected cron triggering to be skipped due to overlap policy 'skip'")
+	}
+}
+
 

@@ -7,6 +7,12 @@ type WorkflowDef struct {
 	Env       map[string]string `yaml:"env"`
 	Steps     []StepDef         `yaml:"steps"`
 	OnFailure *OnFailureDef     `yaml:"on_failure"`
+	Schedule  *ScheduleDef      `yaml:"schedule"`
+}
+
+type ScheduleDef struct {
+	Cron    string `yaml:"cron"`
+	Overlap string `yaml:"overlap"` // "skip" | "allow" (default: "skip")
 }
 
 type StepDef struct {
@@ -17,6 +23,11 @@ type StepDef struct {
 	Retry          *RetryPolicy `yaml:"retry"`
 	IdempotencyKey string       `yaml:"idempotency_key"`
 	Compensation   *CompStep    `yaml:"compensation"`
+	Wait           *WaitDef     `yaml:"wait"`
+}
+
+type WaitDef struct {
+	Duration string `yaml:"duration"` // e.g. "5s", "10m"
 }
 
 type RetryPolicy struct {
