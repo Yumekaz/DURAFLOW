@@ -54,10 +54,20 @@ func main() {
 }
 
 func getStore() (store.EventStore, error) {
-	resolvedPath := resolveDBPath(dbPathFlag)
+	dbStr := dbPathFlag
+	if strings.HasPrefix(dbStr, "postgres://") || strings.HasPrefix(dbStr, "postgresql://") {
+		s := store.NewPostgresStore(dbStr)
+		if err := s.Init(); err != nil {
+			return nil, fmt.Errorf("failed to init postgres store: %w", err)
+		}
+		return s, nil
+	}
+
+	// Fallback to SQLite
+	resolvedPath := resolveDBPath(dbStr)
 	s := store.NewSQLiteStore(resolvedPath)
 	if err := s.Init(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to init sqlite store: %w", err)
 	}
 	return s, nil
 }
