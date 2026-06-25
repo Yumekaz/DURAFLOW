@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 )
 
 func TestCalculateBackoff_Fixed(t *testing.T) {

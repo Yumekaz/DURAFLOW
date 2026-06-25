@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 	_ "modernc.org/sqlite"
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 	"gopkg.in/yaml.v3"
 )
 

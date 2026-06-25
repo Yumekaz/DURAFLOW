@@ -3,7 +3,7 @@ package engine
 import (
 	"time"
 
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 )
 
 // CalculateBackoff computes the delay duration before the next retry attempt.

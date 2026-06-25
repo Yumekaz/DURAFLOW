@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yumekaz/duraflow/internal/executor"
-	"github.com/yumekaz/duraflow/internal/store"
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/executor"
+	"github.com/yumekaz/duraflow/pkg/store"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 )
 
 type WorkflowEngine struct {
@@ -39,8 +39,10 @@ func (e *WorkflowEngine) AppendEvent(event *store.Event) error {
 }
 
 func (e *WorkflowEngine) RunWorkflow(ctx context.Context, def *workflow.WorkflowDef, orderedSteps []workflow.StepDef, hash string, yamlContent string) (string, error) {
-	runID := uuid.New().String()
+	return e.RunWorkflowWithID(ctx, uuid.New().String(), def, orderedSteps, hash, yamlContent)
+}
 
+func (e *WorkflowEngine) RunWorkflowWithID(ctx context.Context, runID string, def *workflow.WorkflowDef, orderedSteps []workflow.StepDef, hash string, yamlContent string) (string, error) {
 	// 1. Register workflow definition
 	if err := e.store.RegisterWorkflow(def, hash, yamlContent); err != nil {
 		return "", fmt.Errorf("failed to register workflow: %w", err)
@@ -246,7 +248,12 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 		maxAttempts = step.Retry.MaxAttempts
 	}
 
-	// If the parent context was cancelled/timed out, abort execution immediately
+	// If the parent context was cancelled (worker shutdown), abort without marking state as failed.
+	if ctx.Err() == context.Canceled {
+		return ctx.Err()
+	}
+
+	// If the parent context was cancelled/timed out (other errors), abort execution immediately
 	if ctx.Err() != nil {
 		st := &store.StepState{
 			RunID:       runID,

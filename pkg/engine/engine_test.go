@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yumekaz/duraflow/internal/executor"
-	"github.com/yumekaz/duraflow/internal/store"
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/executor"
+	"github.com/yumekaz/duraflow/pkg/store"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 )
 
 func TestWorkflowEngine_SuccessRun(t *testing.T) {

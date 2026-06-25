@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yumekaz/duraflow/internal/engine"
-	"github.com/yumekaz/duraflow/internal/store"
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/engine"
+	"github.com/yumekaz/duraflow/pkg/store"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 )
 
 type WorkerDaemon struct {
@@ -136,7 +136,7 @@ func (w *WorkerDaemon) heartbeatLoop() {
 
 func (w *WorkerDaemon) pollLoop() {
 	defer w.wg.Done()
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {

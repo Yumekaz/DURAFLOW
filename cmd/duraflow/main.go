@@ -13,12 +13,12 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"github.com/spf13/cobra"
-	"github.com/yumekaz/duraflow/internal/api"
-	"github.com/yumekaz/duraflow/internal/engine"
-	"github.com/yumekaz/duraflow/internal/executor"
-	"github.com/yumekaz/duraflow/internal/store"
-	"github.com/yumekaz/duraflow/internal/worker"
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/api"
+	"github.com/yumekaz/duraflow/pkg/engine"
+	"github.com/yumekaz/duraflow/pkg/executor"
+	"github.com/yumekaz/duraflow/pkg/store"
+	"github.com/yumekaz/duraflow/pkg/worker"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 )
 
 var (

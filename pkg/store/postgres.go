@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 	"github.com/robfig/cron/v3"
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 	"gopkg.in/yaml.v3"
 )
 

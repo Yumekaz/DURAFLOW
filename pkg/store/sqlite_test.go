@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 )
 
 func TestSQLiteStore_LifecycleAndOperations(t *testing.T) {

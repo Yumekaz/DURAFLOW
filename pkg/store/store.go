@@ -3,7 +3,7 @@ package store
 import (
 	"time"
 
-	"github.com/yumekaz/duraflow/internal/workflow"
+	"github.com/yumekaz/duraflow/pkg/workflow"
 )
 
 type WorkflowRun struct {
