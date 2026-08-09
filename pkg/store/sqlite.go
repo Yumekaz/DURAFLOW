@@ -35,6 +35,7 @@ func (s *SQLiteStore) Init() error {
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 
 	s.db = db
 
@@ -42,7 +43,7 @@ func (s *SQLiteStore) Init() error {
 	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 		return fmt.Errorf("failed to set WAL mode: %w", err)
 	}
-	if _, err := db.Exec("PRAGMA busy_timeout=5000;"); err != nil {
+	if _, err := db.Exec("PRAGMA busy_timeout=30000;"); err != nil {
 		return fmt.Errorf("failed to set busy timeout: %w", err)
 	}
 	if _, err := db.Exec("PRAGMA foreign_keys=ON;"); err != nil {

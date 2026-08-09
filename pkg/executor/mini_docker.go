@@ -14,17 +14,116 @@ import (
 
 type MiniDockerExecutor struct {
 	pythonPath string
+	modulePath string
 }
 
 func NewMiniDockerExecutor() *MiniDockerExecutor {
-	pythonPath := os.Getenv("MINI_DOCKER_PYTHON_PATH")
-	if pythonPath == "" {
-		pythonPath = "/home/yumekaz/Desktop/Mini-Docker/venv/bin/python3"
-		if _, err := os.Stat(pythonPath); err != nil {
-			pythonPath = "python3"
+	pythonPath, modulePath := resolveMiniDockerRuntime()
+	return &MiniDockerExecutor{pythonPath: pythonPath, modulePath: modulePath}
+}
+
+const (
+	miniDockerPythonPathEnv = "MINI_DOCKER_PYTHON_PATH"
+	miniDockerPythonEnv     = "MINI_DOCKER_PYTHON"
+	miniDockerSourceEnv     = "MINI_DOCKER_SRC"
+	miniDockerPathEnv       = "MINI_DOCKER_PATH"
+)
+
+func resolveMiniDockerRuntime() (string, string) {
+	return resolveMiniDockerRuntimeFrom(searchRoots())
+}
+
+func resolveMiniDockerRuntimeFrom(roots []string) (string, string) {
+	modulePath := miniDockerSourceFromEnv()
+	if modulePath == "" {
+		modulePath = findSiblingMiniDocker(roots)
+	}
+
+	if pythonPath := os.Getenv(miniDockerPythonPathEnv); pythonPath != "" {
+		return pythonPath, modulePath
+	}
+	if pythonPath := os.Getenv(miniDockerPythonEnv); pythonPath != "" {
+		return pythonPath, modulePath
+	}
+
+	if modulePath != "" {
+		for _, candidate := range []string{
+			filepath.Join(modulePath, "venv", "bin", "python3"),
+			filepath.Join(modulePath, "venv", "bin", "python"),
+			filepath.Join(modulePath, ".venv", "bin", "python3"),
+			filepath.Join(modulePath, ".venv", "bin", "python"),
+		} {
+			if isExecutable(candidate) {
+				return candidate, modulePath
+			}
 		}
 	}
-	return &MiniDockerExecutor{pythonPath: pythonPath}
+
+	if pythonPath, err := exec.LookPath("python3"); err == nil {
+		return pythonPath, modulePath
+	}
+	if pythonPath, err := exec.LookPath("python"); err == nil {
+		return pythonPath, modulePath
+	}
+	// Preserve the previous fallback and let Execute return the command error.
+	return "python3", modulePath
+}
+
+func miniDockerSourceFromEnv() string {
+	for _, name := range []string{miniDockerSourceEnv, miniDockerPathEnv} {
+		if source := os.Getenv(name); source != "" && hasMiniDockerModule(source) {
+			return source
+		}
+	}
+	return ""
+}
+
+func findSiblingMiniDocker(roots []string) string {
+	for _, root := range roots {
+		current, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		for {
+			candidate := filepath.Join(current, "Mini-Docker")
+			if hasMiniDockerModule(candidate) {
+				return candidate
+			}
+			if filepath.Base(current) == "DURAFLOW" {
+				candidate = filepath.Join(filepath.Dir(current), "Mini-Docker")
+				if hasMiniDockerModule(candidate) {
+					return candidate
+				}
+			}
+			parent := filepath.Dir(current)
+			if parent == current {
+				break
+			}
+			current = parent
+		}
+	}
+	return ""
+}
+
+func searchRoots() []string {
+	roots := make([]string, 0, 2)
+	if cwd, err := os.Getwd(); err == nil {
+		roots = append(roots, cwd)
+	}
+	if executable, err := os.Executable(); err == nil {
+		roots = append(roots, filepath.Dir(executable))
+	}
+	return roots
+}
+
+func hasMiniDockerModule(path string) bool {
+	info, err := os.Stat(filepath.Join(path, "mini_docker", "__init__.py"))
+	return err == nil && !info.IsDir()
+}
+
+func isExecutable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
 }
 
 func (m *MiniDockerExecutor) Execute(ctx context.Context, req ExecutionRequest) (*Result, error) {
@@ -64,6 +163,9 @@ func (m *MiniDockerExecutor) Execute(ctx context.Context, req ExecutionRequest) 
 
 	cmd := exec.Command(m.pythonPath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if m.modulePath != "" {
+		cmd.Env = append(os.Environ(), "PYTHONPATH="+prependPythonPath(os.Getenv("PYTHONPATH"), m.modulePath))
+	}
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -138,4 +240,11 @@ func (m *MiniDockerExecutor) Execute(ctx context.Context, req ExecutionRequest) 
 		Duration: duration,
 		Error:    execErr,
 	}, nil
+}
+
+func prependPythonPath(existing, modulePath string) string {
+	if existing == "" {
+		return modulePath
+	}
+	return modulePath + string(os.PathListSeparator) + existing
 }
