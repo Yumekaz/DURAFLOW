@@ -605,25 +605,50 @@ func (p *PostgresStore) AcquireLease(runID, stepID, workerID string, duration ti
 	}
 	defer tx.Rollback()
 
-	queryLease := `
-		SELECT worker_id, expires_at, status FROM leases
-		WHERE run_id = ? AND step_id = ?;
+	// Claim-first: create the lease row if it does not exist. RowsAffected
+	// tells us atomically whether we won the initial claim, closing the
+	// check-then-insert race that a bare SELECT cannot.
+	queryClaim := `
+		INSERT INTO leases (run_id, step_id, worker_id, expires_at, status)
+		VALUES (?, ?, '', '1970-01-01T00:00:00Z', 'PENDING')
+		ON CONFLICT(run_id, step_id) DO NOTHING;
 	`
-	var currentWorkerID, expiresAt, status string
-	err = tx.QueryRow(p.translate(queryLease), runID, stepID).Scan(&currentWorkerID, &expiresAt, &status)
+	claimRes, err := tx.Exec(p.translate(queryClaim), runID, stepID)
+	if err != nil {
+		return false, fmt.Errorf("failed to claim lease: %w", err)
+	}
+	claimedNew, err := claimRes.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read claim result: %w", err)
+	}
 
 	isEligible := false
-	if err == sql.ErrNoRows {
-		isEligible = true
-	} else if err != nil {
-		return false, err
-	} else {
-		nowStr := time.Now().UTC().Format(time.RFC3339Nano)
-		if status == "RELEASED" {
+	if claimedNew == 0 {
+		// Row exists: lock it so concurrent acquirers serialize on this
+		// transaction instead of both reading the same stale state.
+		queryLease := `
+			SELECT worker_id, expires_at, status FROM leases
+			WHERE run_id = ? AND step_id = ?
+			FOR UPDATE;
+		`
+		var currentWorkerID, expiresAt, status string
+		err = tx.QueryRow(p.translate(queryLease), runID, stepID).Scan(&currentWorkerID, &expiresAt, &status)
+
+		switch {
+		case err == sql.ErrNoRows:
 			isEligible = true
-		} else if expiresAt < nowStr {
+		case err != nil:
+			return false, fmt.Errorf("failed to query lease: %w", err)
+		case status == "RELEASED":
 			isEligible = true
-		} else {
+		default:
+			// Compare parsed timestamps: RFC3339Nano strings omit trailing
+			// zeros, so lexicographic ordering misjudges expiry boundaries.
+			expiresTime, parseErr := time.Parse(time.RFC3339Nano, expiresAt)
+			if parseErr != nil || !expiresTime.After(time.Now().UTC()) {
+				isEligible = true
+				break
+			}
 			queryWorker := `
 				SELECT last_heartbeat_at, status FROM workers
 				WHERE worker_id = ?;
@@ -633,10 +658,10 @@ func (p *PostgresStore) AcquireLease(runID, stepID, workerID string, duration ti
 			if err == sql.ErrNoRows {
 				isEligible = true
 			} else if err != nil {
-				return false, err
+				return false, fmt.Errorf("failed to query owning worker: %w", err)
 			} else {
-				heartbeatTime, parseErr := time.Parse(time.RFC3339Nano, lastHeartbeat)
-				if parseErr != nil || workerStatus != "ACTIVE" || time.Since(heartbeatTime) > 10*time.Second {
+				heartbeatTime, hbErr := time.Parse(time.RFC3339Nano, lastHeartbeat)
+				if hbErr != nil || workerStatus != "ACTIVE" || time.Since(heartbeatTime) > 10*time.Second {
 					isEligible = true
 				}
 			}
