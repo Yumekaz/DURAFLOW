@@ -38,6 +38,15 @@ func (e *WorkflowEngine) AppendEvent(event *store.Event) error {
 	return e.appendEvent(event)
 }
 
+// logEventErr reports a failed audit-event append without aborting the step's
+// already-determined terminal transition. Step-state writes are checked and
+// propagated; audit events must not fail silently.
+func logEventErr(eventType string, err error) {
+	if err != nil {
+		fmt.Printf("Engine: WARNING: failed to append %s event: %v\n", eventType, err)
+	}
+}
+
 func (e *WorkflowEngine) RunWorkflow(ctx context.Context, def *workflow.WorkflowDef, orderedSteps []workflow.StepDef, hash string, yamlContent string) (string, error) {
 	return e.RunWorkflowWithID(ctx, uuid.New().String(), def, orderedSteps, hash, yamlContent)
 }
@@ -264,16 +273,18 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 			LastError:   ctx.Err().Error(),
 			CompletedAt: now,
 		}
-		_ = e.store.UpsertStepState(st)
+		if err := e.store.UpsertStepState(st); err != nil {
+			logEventErr("step-state (ctx-abort) upsert", err)
+		}
 
-		_ = e.appendEvent(&store.Event{
+		logEventErr(EventStepFailed, e.appendEvent(&store.Event{
 			RunID:        runID,
 			WorkflowName: def.Name,
 			EventType:    EventStepFailed,
 			StepID:       step.ID,
 			Attempt:      attempt,
 			PayloadJSON:  fmt.Sprintf(`{"error":%q}`, ctx.Err().Error()),
-		})
+		}))
 		return ctx.Err()
 	}
 
@@ -288,16 +299,18 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 		// Step succeeded!
 		st.Status = StepSucceeded
 		st.CompletedAt = now
-		_ = e.store.UpsertStepState(st)
+		if err := e.store.UpsertStepState(st); err != nil {
+			return fmt.Errorf("failed to persist step %s success state: %w", step.ID, err)
+		}
 
-		_ = e.appendEvent(&store.Event{
+		logEventErr(EventStepSucceeded, e.appendEvent(&store.Event{
 			RunID:        runID,
 			WorkflowName: def.Name,
 			EventType:    EventStepSucceeded,
 			StepID:       step.ID,
 			Attempt:      attempt,
 			PayloadJSON:  "{}",
-		})
+		}))
 
 		// Check if all steps in the workflow are SUCCEEDED
 		states, err := e.store.GetStepStates(runID)
@@ -316,13 +329,15 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 			if allSucceeded {
 				// Mark workflow run as COMPLETED
 				now = time.Now().UTC().Format(time.RFC3339Nano)
-				_ = e.store.UpdateRunStatus(runID, StatusCompleted, map[string]string{"completed_at": now})
-				_ = e.appendEvent(&store.Event{
+				if err := e.store.UpdateRunStatus(runID, StatusCompleted, map[string]string{"completed_at": now}); err != nil {
+					return fmt.Errorf("failed to mark run %s completed: %w", runID, err)
+				}
+				logEventErr(EventWorkflowCompleted, e.appendEvent(&store.Event{
 					RunID:        runID,
 					WorkflowName: def.Name,
 					EventType:    EventWorkflowCompleted,
 					PayloadJSON:  "{}",
-				})
+				}))
 			}
 		}
 		return nil
@@ -344,36 +359,38 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 		st.Status = StepFailedFinal
 		st.LastError = stepErrStr
 		st.CompletedAt = now
-		_ = e.store.UpsertStepState(st)
+		if err := e.store.UpsertStepState(st); err != nil {
+			return fmt.Errorf("failed to persist step %s final failure state: %w", step.ID, err)
+		}
 
 		if isTimeout {
-			_ = e.appendEvent(&store.Event{
+			logEventErr(EventStepTimedOut, e.appendEvent(&store.Event{
 				RunID:        runID,
 				WorkflowName: def.Name,
 				EventType:    EventStepTimedOut,
 				StepID:       step.ID,
 				Attempt:      attempt,
 				PayloadJSON:  fmt.Sprintf(`{"error":%q}`, stepErrStr),
-			})
+			}))
 		} else {
-			_ = e.appendEvent(&store.Event{
+			logEventErr(EventStepFailed, e.appendEvent(&store.Event{
 				RunID:        runID,
 				WorkflowName: def.Name,
 				EventType:    EventStepFailed,
 				StepID:       step.ID,
 				Attempt:      attempt,
 				PayloadJSON:  fmt.Sprintf(`{"error":%q}`, stepErrStr),
-			})
+			}))
 		}
 
-		_ = e.appendEvent(&store.Event{
+		logEventErr(EventStepFailedFinal, e.appendEvent(&store.Event{
 			RunID:        runID,
 			WorkflowName: def.Name,
 			EventType:    EventStepFailedFinal,
 			StepID:       step.ID,
 			Attempt:      attempt,
 			PayloadJSON:  fmt.Sprintf(`{"error":%q}`, stepErrStr),
-		})
+		}))
 
 		// Check if we need to compensate
 		if def.OnFailure != nil && def.OnFailure.Compensate {
@@ -397,26 +414,30 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 
 			if hasCompensation {
 				now = time.Now().UTC().Format(time.RFC3339Nano)
-				_ = e.store.UpdateRunStatus(runID, StatusCompensating, nil)
-				_ = e.appendEvent(&store.Event{
+				if err := e.store.UpdateRunStatus(runID, StatusCompensating, nil); err != nil {
+					return fmt.Errorf("failed to mark run %s compensating: %w", runID, err)
+				}
+				logEventErr(EventWorkflowCompensationStarted, e.appendEvent(&store.Event{
 					RunID:        runID,
 					WorkflowName: def.Name,
 					EventType:    EventWorkflowCompensationStarted,
 					PayloadJSON:  fmt.Sprintf(`{"failed_step":%q,"error":%q}`, step.ID, stepErrStr),
-				})
+				}))
 				return fmt.Errorf("step execution failed: %s; entering compensation", stepErrStr)
 			}
 		}
 
 		// Mark workflow run as FAILED
 		now = time.Now().UTC().Format(time.RFC3339Nano)
-		_ = e.store.UpdateRunStatus(runID, StatusFailed, map[string]string{"failed_at": now})
-		_ = e.appendEvent(&store.Event{
+		if err := e.store.UpdateRunStatus(runID, StatusFailed, map[string]string{"failed_at": now}); err != nil {
+			return fmt.Errorf("failed to mark run %s failed: %w", runID, err)
+		}
+		logEventErr(EventWorkflowFailed, e.appendEvent(&store.Event{
 			RunID:        runID,
 			WorkflowName: def.Name,
 			EventType:    EventWorkflowFailed,
 			PayloadJSON:  fmt.Sprintf(`{"failed_step":%q,"error":%q}`, step.ID, stepErrStr),
-		})
+		}))
 
 		return fmt.Errorf("step execution failed: %s", stepErrStr)
 	}
@@ -428,26 +449,28 @@ func (e *WorkflowEngine) ExecuteStepAttempt(ctx context.Context, runID string, d
 	st.Status = StepRetryScheduled
 	st.LastError = stepErrStr
 	st.NextRetryAt = nextRetryAt
-	_ = e.store.UpsertStepState(st)
+	if err := e.store.UpsertStepState(st); err != nil {
+		return fmt.Errorf("failed to persist step %s retry schedule: %w", step.ID, err)
+	}
 
 	if isTimeout {
-		_ = e.appendEvent(&store.Event{
+		logEventErr(EventStepTimedOut, e.appendEvent(&store.Event{
 			RunID:        runID,
 			WorkflowName: def.Name,
 			EventType:    EventStepTimedOut,
 			StepID:       step.ID,
 			Attempt:      attempt,
 			PayloadJSON:  fmt.Sprintf(`{"error":%q}`, stepErrStr),
-		})
+		}))
 	} else {
-		_ = e.appendEvent(&store.Event{
+		logEventErr(EventStepFailed, e.appendEvent(&store.Event{
 			RunID:        runID,
 			WorkflowName: def.Name,
 			EventType:    EventStepFailed,
 			StepID:       step.ID,
 			Attempt:      attempt,
 			PayloadJSON:  fmt.Sprintf(`{"error":%q}`, stepErrStr),
-		})
+		}))
 	}
 
 	_ = e.appendEvent(&store.Event{
