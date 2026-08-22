@@ -9,9 +9,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
-	_ "modernc.org/sqlite"
 	"github.com/yumekaz/duraflow/pkg/workflow"
 	"gopkg.in/yaml.v3"
+	_ "modernc.org/sqlite"
 )
 
 type SQLiteStore struct {
@@ -515,32 +515,35 @@ func (s *SQLiteStore) AcquireLease(runID, stepID, workerID string, duration time
 	err = tx.QueryRow(queryLease, runID, stepID).Scan(&currentWorkerID, &expiresAt, &status)
 
 	isEligible := false
-	if err == sql.ErrNoRows {
+	switch {
+	case err == sql.ErrNoRows:
 		isEligible = true
-	} else if err != nil {
+	case err != nil:
 		return false, fmt.Errorf("failed to query lease: %w", err)
-	} else {
-		nowStr := time.Now().UTC().Format(time.RFC3339Nano)
-		if status == "RELEASED" {
+	case status == "RELEASED":
+		isEligible = true
+	default:
+		// Compare parsed timestamps: RFC3339Nano strings omit trailing
+		// zeros, so lexicographic ordering misjudges expiry boundaries.
+		expiresTime, parseErr := time.Parse(time.RFC3339Nano, expiresAt)
+		if parseErr != nil || !expiresTime.After(time.Now().UTC()) {
 			isEligible = true
-		} else if expiresAt < nowStr {
+			break
+		}
+		queryWorker := `
+			SELECT last_heartbeat_at, status FROM workers
+			WHERE worker_id = ?;
+		`
+		var lastHeartbeat, workerStatus string
+		err = tx.QueryRow(queryWorker, currentWorkerID).Scan(&lastHeartbeat, &workerStatus)
+		if err == sql.ErrNoRows {
 			isEligible = true
+		} else if err != nil {
+			return false, fmt.Errorf("failed to query owning worker: %w", err)
 		} else {
-			queryWorker := `
-				SELECT last_heartbeat_at, status FROM workers
-				WHERE worker_id = ?;
-			`
-			var lastHeartbeat, workerStatus string
-			err = tx.QueryRow(queryWorker, currentWorkerID).Scan(&lastHeartbeat, &workerStatus)
-			if err == sql.ErrNoRows {
+			heartbeatTime, hbErr := time.Parse(time.RFC3339Nano, lastHeartbeat)
+			if hbErr != nil || workerStatus != "ACTIVE" || time.Since(heartbeatTime) > 10*time.Second {
 				isEligible = true
-			} else if err != nil {
-				return false, fmt.Errorf("failed to query owning worker: %w", err)
-			} else {
-				heartbeatTime, parseErr := time.Parse(time.RFC3339Nano, lastHeartbeat)
-				if parseErr != nil || workerStatus != "ACTIVE" || time.Since(heartbeatTime) > 10*time.Second {
-					isEligible = true
-				}
 			}
 		}
 	}
@@ -860,7 +863,7 @@ func (s *SQLiteStore) TriggerCronSchedule(workflowName string, now time.Time) (s
 
 	// Trigger run:
 	runID := uuid.New().String()
-	
+
 	// 1. Create run record
 	insertRun := `
 		INSERT INTO workflow_runs (run_id, workflow_name, workflow_version, status, created_at, metadata_json)
@@ -936,5 +939,3 @@ func (s *SQLiteStore) TriggerCronSchedule(workflowName string, now time.Time) (s
 
 	return runID, true, nil
 }
-
-
