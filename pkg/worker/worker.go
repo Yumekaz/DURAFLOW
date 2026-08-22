@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,23 +16,23 @@ import (
 )
 
 type WorkerDaemon struct {
-	workerID  string
-	store     store.EventStore
-	eng       *engine.WorkflowEngine
-	activeJobs sync.Map // map[string]chan struct{} for step lease cancel/renewal
-	wg        sync.WaitGroup
-	ctx       context.Context
-	cancel    context.CancelFunc
+	workerID   string
+	store      store.EventStore
+	eng        *engine.WorkflowEngine
+	activeJobs sync.Map // map[string]context.CancelFunc for in-flight step cancellation
+	wg         sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 func NewWorkerDaemon(store store.EventStore, eng *engine.WorkflowEngine) *WorkerDaemon {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &WorkerDaemon{
-		workerID:  uuid.New().String(),
-		store:     store,
-		eng:       eng,
-		ctx:       ctx,
-		cancel:    cancel,
+		workerID: uuid.New().String(),
+		store:    store,
+		eng:      eng,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
@@ -107,6 +108,27 @@ func (w *WorkerDaemon) triggerCronSchedules() {
 func (w *WorkerDaemon) Stop() {
 	w.cancel()
 	w.wg.Wait()
+}
+
+// CancelRun aborts all in-flight step executions belonging to runID by
+// cancelling their execution contexts. Affected steps observe ctx.Canceled,
+// which the engine treats as resumable: state stays RUNNING for a later
+// ResumeWorkflow instead of being marked failed.
+func (w *WorkerDaemon) CancelRun(runID string) int {
+	prefix := runID + ":"
+	cancelled := 0
+	w.activeJobs.Range(func(key, value any) bool {
+		k, ok := key.(string)
+		if !ok || !strings.HasPrefix(k, prefix) {
+			return true
+		}
+		if cancelFn, ok := value.(context.CancelFunc); ok {
+			cancelFn()
+			cancelled++
+		}
+		return true
+	})
+	return cancelled
 }
 
 func (w *WorkerDaemon) heartbeatLoop() {
@@ -337,16 +359,16 @@ func (w *WorkerDaemon) executeStep(runID string, def *workflow.WorkflowDef, step
 
 	jobKey := fmt.Sprintf("%s:%s", runID, step.ID)
 	stopLeaseRenewal := make(chan struct{})
-	w.activeJobs.Store(jobKey, stopLeaseRenewal)
 	defer w.activeJobs.Delete(jobKey)
+
+	// Execution context: stored so CancelRun can abort this step mid-flight.
+	stepCtx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+	w.activeJobs.Store(jobKey, cancel)
 
 	// Start Lease Renewal Loop
 	leaseDuration := 10 * time.Second
 	go w.leaseRenewalLoop(runID, step.ID, leaseDuration, stopLeaseRenewal)
-
-	// Execute the step attempt
-	stepCtx, cancel := context.WithCancel(w.ctx)
-	defer cancel()
 
 	fmt.Printf("Worker %s starting step %s (attempt %d) of run %s\n", w.workerID, step.ID, attempt, runID)
 	execErr := w.eng.ExecuteStepAttempt(stepCtx, runID, def, step, attempt)
@@ -407,10 +429,10 @@ func (w *WorkerDaemon) handleCompensation(run *store.WorkflowRun, def *workflow.
 	for id, step := range compStepsMap {
 		st, ok := stateMap[id]
 		if ok {
-			if st.Status == engine.StepSucceeded || 
-			   st.Status == engine.StepCompensating || 
-			   st.Status == engine.StepCompensated || 
-			   st.Status == engine.StepCompensationFailed {
+			if st.Status == engine.StepSucceeded ||
+				st.Status == engine.StepCompensating ||
+				st.Status == engine.StepCompensated ||
+				st.Status == engine.StepCompensationFailed {
 				candidates = append(candidates, compCandidate{
 					step:        step,
 					state:       st,
@@ -455,7 +477,7 @@ func (w *WorkerDaemon) handleCompensation(run *store.WorkflowRun, def *workflow.
 		if c.state.Status == engine.StepCompensated {
 			continue
 		}
-		
+
 		allCompensated = false
 
 		if c.state.Status == engine.StepCompensationFailed {

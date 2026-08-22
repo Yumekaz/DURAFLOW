@@ -292,9 +292,18 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]string{
-		"message": "Workflow run cancelled successfully",
-		"run_id":  runID,
+	// Signal in-flight steps on this worker to abort (no-op when this server
+	// does not own a worker). Cancelled contexts leave step state RUNNING,
+	// which ResumeWorkflow can pick up later.
+	signalled := 0
+	if s.worker != nil {
+		signalled = s.worker.CancelRun(runID)
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"message":         "Workflow run cancelled successfully",
+		"run_id":          runID,
+		"steps_signalled": signalled,
 	})
 }
 
