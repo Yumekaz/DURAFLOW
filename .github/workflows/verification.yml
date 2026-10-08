@@ -1,0 +1,92 @@
+name: Verification
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  privileged-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: DURAFLOW
+      - uses: actions/checkout@v4
+        with:
+          repository: Yumekaz/Mini-Docker
+          ref: 5c83126f83fcd21355e5931d0fbabde838dd7e9b
+          path: Mini-Docker
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: DURAFLOW/go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated static BusyBox prerequisite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox-static iproute2 iptables
+          mkdir -p Mini-Docker/rootfs/bin
+          cp /usr/bin/busybox Mini-Docker/rootfs/bin/busybox
+      - name: Execute privileged runtime tests
+        working-directory: DURAFLOW
+        run: |
+          set -euo pipefail
+          mkdir -p verification
+          go test -c ./pkg/executor -o verification/executor.test
+          sudo env MINI_DOCKER_SRC="$GITHUB_WORKSPACE/Mini-Docker" \
+            MINI_DOCKER_PYTHON_PATH="$(command -v python)" \
+            MINI_DOCKER_ROOT="$GITHUB_WORKSPACE/DURAFLOW/verification/runtime-root" \
+            MINI_DOCKER_RUN="$GITHUB_WORKSPACE/DURAFLOW/verification/runtime-run" \
+            verification/executor.test -test.run '^TestMiniDockerExecutor_' -test.v -test.timeout 2m \
+            | tee verification/runtime.log
+          ! grep -q '^--- SKIP' verification/runtime.log
+          test "$(grep -c '^--- PASS: TestMiniDockerExecutor_' verification/runtime.log)" -eq 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: duraflow-privileged-runtime
+          path: DURAFLOW/verification/runtime.log
+  unit-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: acceptance
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: acceptance-only
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DURAFLOW_TEST_POSTGRES_DSN: postgres://postgres:acceptance-only@127.0.0.1:5432/acceptance?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test all packages against real PostgreSQL
+        run: |
+          mkdir -p verification
+          set -o pipefail
+          go test ./... -count=1 -timeout 12m -json | tee verification/unit.jsonl
+      - name: Require executed PostgreSQL integration tests
+        run: |
+          python3 - <<'PY'
+          import json
+          rows=[json.loads(line) for line in open('verification/unit.jsonl')]
+          expected={'TestPostgresStore_LifecycleAndOperations','TestPostgresLeaseConcurrentInitialClaim','TestPostgresStore_WorkersAndLeases','TestPostgresTimersAndCronSchedules'}
+          passed={r.get('Test') for r in rows if r.get('Action')=='pass'}
+          assert expected <= passed, f'PostgreSQL tests missing: {expected-passed}'
+          PY
+      - name: Build CLI
+        run: go build ./cmd/duraflow
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: duraflow-unit-postgres
+          path: verification/
