@@ -1,7 +1,9 @@
 package store
 
 import (
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -214,6 +216,56 @@ steps:
 	}
 	if len(incomplete) != 0 {
 		t.Errorf("expected 0 incomplete runs, got: %+v", incomplete)
+	}
+}
+
+func TestPostgresLeaseConcurrentInitialClaim(t *testing.T) {
+	st := getTestPostgresStore(t)
+	defer st.Close()
+	if err := st.CreateRun(&WorkflowRun{RunID: "concurrent-claim", WorkflowName: "lease-test", WorkflowVersion: 1, Status: "RUNNING"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertStepState(&StepState{RunID: "concurrent-claim", StepID: "step", Status: "PENDING", MaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	const contenders = 16
+	for i := 0; i < contenders; i++ {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if err := st.RegisterWorker(&Worker{WorkerID: fmt.Sprintf("contender-%d", i), Hostname: "local", PID: i + 1, StartedAt: now, LastHeartbeatAt: now, Status: "ACTIVE"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := make(chan struct{})
+	results := make(chan bool, contenders)
+	errors := make(chan error, contenders)
+	var wg sync.WaitGroup
+	for i := 0; i < contenders; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			won, err := st.AcquireLease("concurrent-claim", "step", fmt.Sprintf("contender-%d", i), 30*time.Second)
+			results <- won
+			errors <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	winners := 0
+	for won := range results {
+		if won {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("initial lease claim had %d winners, want exactly 1", winners)
 	}
 }
 
@@ -437,7 +489,7 @@ steps:
   - id: step-1
     run: "echo 'hello'"
 `,
-		Status:         "ACTIVE",
+		Status: "ACTIVE",
 	}
 
 	if err := store.UpsertCronSchedule(cs); err != nil {

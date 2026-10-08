@@ -622,7 +622,7 @@ func (p *PostgresStore) AcquireLease(runID, stepID, workerID string, duration ti
 		return false, fmt.Errorf("failed to read claim result: %w", err)
 	}
 
-	isEligible := false
+	isEligible := claimedNew > 0
 	if claimedNew == 0 {
 		// Row exists: lock it so concurrent acquirers serialize on this
 		// transaction instead of both reading the same stale state.

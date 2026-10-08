@@ -11,11 +11,34 @@ import (
 
 func miniDockerRootfs(t *testing.T) string {
 	t.Helper()
+	if os.Geteuid() != 0 && os.Getenv("DURAFLOW_TEST_MINIDOCKER") != "1" {
+		t.Skip("real Mini-Docker execution requires privileged namespaces; set DURAFLOW_TEST_MINIDOCKER=1 to explicitly test a capable rootless host")
+	}
 	_, modulePath := resolveMiniDockerRuntime()
 	if modulePath == "" {
 		t.Skip("Mini-Docker sibling checkout is not available")
 	}
-	return filepath.Join(modulePath, "rootfs")
+	// --no-overlay must never run tests against the shared runtime rootfs.
+	// Use the same minimal static BusyBox layout as Mini-Docker's root proof.
+	busybox, err := os.ReadFile(filepath.Join(modulePath, "rootfs", "bin", "busybox"))
+	if err != nil || len(busybox) == 0 {
+		t.Fatalf("test BusyBox prerequisite is missing/empty: %v", err)
+	}
+	rootfs := t.TempDir()
+	for _, dir := range []string{"bin", "dev", "proc", "sys", "tmp", "etc"} {
+		if err := os.MkdirAll(filepath.Join(rootfs, dir), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "bin", "busybox"), busybox, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"sh", "echo", "sleep"} {
+		if err := os.Symlink("busybox", filepath.Join(rootfs, "bin", name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rootfs
 }
 
 func TestMiniDockerExecutor_Success(t *testing.T) {
