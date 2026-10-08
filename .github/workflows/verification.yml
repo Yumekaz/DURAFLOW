@@ -37,10 +37,14 @@ jobs:
           set -euo pipefail
           mkdir -p verification
           go test -c ./pkg/executor -o verification/executor.test
+          # Root in a user namespace cannot bypass the runner user's private
+          # home/workspace ancestors. Keep runtime state in an owned private
+          # root directory instead of weakening workspace permissions.
+          proof_runtime_state=$(sudo mktemp -d /tmp/df-runtime.XXXXXX)
           sudo env MINI_DOCKER_SRC="$GITHUB_WORKSPACE/Mini-Docker" \
             MINI_DOCKER_PYTHON_PATH="$(command -v python)" \
-            MINI_DOCKER_ROOT="$GITHUB_WORKSPACE/DURAFLOW/verification/runtime-root" \
-            MINI_DOCKER_RUN="$GITHUB_WORKSPACE/DURAFLOW/verification/runtime-run" \
+            MINI_DOCKER_ROOT="$proof_runtime_state/root" \
+            MINI_DOCKER_RUN="$proof_runtime_state/run" \
             verification/executor.test -test.run '^TestMiniDockerExecutor_' -test.v -test.timeout 2m \
             | tee verification/runtime.log
           ! grep -q '^--- SKIP' verification/runtime.log
