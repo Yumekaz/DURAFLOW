@@ -20,6 +20,7 @@ type WorkerDaemon struct {
 	store      store.EventStore
 	eng        *engine.WorkflowEngine
 	activeJobs sync.Map // map[string]context.CancelFunc for in-flight step cancellation
+	inFlight   sync.Map // reserved before lease acquisition, including goroutine startup
 	wg         sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -261,9 +262,14 @@ func (w *WorkerDaemon) scanAndRunEligibleSteps() {
 			}
 
 			// Try to acquire lease
+			jobKey := fmt.Sprintf("%s:%s", run.RunID, step.ID)
+			if _, alreadyRunning := w.inFlight.LoadOrStore(jobKey, struct{}{}); alreadyRunning {
+				continue
+			}
 			leaseDuration := 10 * time.Second
 			acquired, err := w.store.AcquireLease(run.RunID, step.ID, w.workerID, leaseDuration)
 			if err != nil || !acquired {
+				w.inFlight.Delete(jobKey)
 				continue
 			}
 
@@ -271,6 +277,7 @@ func (w *WorkerDaemon) scanAndRunEligibleSteps() {
 			updatedStates, err := w.store.GetStepStates(run.RunID)
 			if err != nil {
 				_ = w.store.ReleaseLease(run.RunID, step.ID, w.workerID)
+				w.inFlight.Delete(jobKey)
 				continue
 			}
 			attempt := 1
@@ -320,6 +327,7 @@ func (w *WorkerDaemon) scanAndRunEligibleSteps() {
 					})
 
 					_ = w.store.ReleaseLease(run.RunID, step.ID, w.workerID)
+					w.inFlight.Delete(jobKey)
 					continue
 				}
 
@@ -338,11 +346,7 @@ func (w *WorkerDaemon) scanAndRunEligibleSteps() {
 						})
 					}
 					w.wg.Add(1)
-					go func(rID string, d *workflow.WorkflowDef, s workflow.StepDef, att int) {
-						defer w.wg.Done()
-						_ = w.eng.ExecuteStepAttempt(w.ctx, rID, d, s, att)
-						_ = w.store.ReleaseLease(rID, s.ID, w.workerID)
-					}(run.RunID, def, step, attempt)
+					go w.executeStep(run.RunID, def, step, attempt)
 					continue
 				}
 			}
@@ -358,6 +362,7 @@ func (w *WorkerDaemon) executeStep(runID string, def *workflow.WorkflowDef, step
 	defer w.wg.Done()
 
 	jobKey := fmt.Sprintf("%s:%s", runID, step.ID)
+	defer w.inFlight.Delete(jobKey)
 	stopLeaseRenewal := make(chan struct{})
 	defer w.activeJobs.Delete(jobKey)
 
@@ -518,9 +523,14 @@ func (w *WorkerDaemon) handleCompensation(run *store.WorkflowRun, def *workflow.
 	st := activeCompCandidate.state
 
 	// Try to acquire lease
+	jobKey := fmt.Sprintf("%s:%s", run.RunID, step.ID)
+	if _, alreadyRunning := w.inFlight.LoadOrStore(jobKey, struct{}{}); alreadyRunning {
+		return
+	}
 	leaseDuration := 10 * time.Second
 	acquired, err := w.store.AcquireLease(run.RunID, step.ID, w.workerID, leaseDuration)
 	if err != nil || !acquired {
+		w.inFlight.Delete(jobKey)
 		return
 	}
 
@@ -547,6 +557,7 @@ func (w *WorkerDaemon) handleCompensation(run *store.WorkflowRun, def *workflow.
 
 func (w *WorkerDaemon) executeCompensation(runID string, def *workflow.WorkflowDef, step workflow.StepDef, st *store.StepState) {
 	defer w.wg.Done()
+	defer w.inFlight.Delete(fmt.Sprintf("%s:%s", runID, step.ID))
 
 	jobKey := fmt.Sprintf("comp:%s:%s", runID, step.ID)
 	stopLeaseRenewal := make(chan struct{})

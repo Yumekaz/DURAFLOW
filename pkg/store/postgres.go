@@ -688,13 +688,26 @@ func (p *PostgresStore) AcquireLease(runID, stepID, workerID string, duration ti
 
 	queryStepState := `
 		SELECT status, attempt, max_attempts FROM step_states
-		WHERE run_id = ? AND step_id = ?;
+		WHERE run_id = ? AND step_id = ? FOR UPDATE;
 	`
 	var stepStatus string
 	var attempt, maxAttempts int
 	err = tx.QueryRow(p.translate(queryStepState), runID, stepID).Scan(&stepStatus, &attempt, &maxAttempts)
 	if err != nil && err != sql.ErrNoRows {
 		return false, err
+	}
+	// Recheck terminal state under the transaction's row lock; the scanner
+	// can have observed RUNNING before the previous execution completed.
+	if stepStatus == "SUCCEEDED" || stepStatus == "COMPENSATING" {
+		var runStatus string
+		if err := tx.QueryRow(p.translate("SELECT status FROM workflow_runs WHERE run_id = ?"), runID).Scan(&runStatus); err != nil {
+			return false, err
+		}
+		if runStatus != "COMPENSATING" {
+			return false, nil
+		}
+	} else if stepStatus == "FAILED" || stepStatus == "SKIPPED" || stepStatus == "COMPENSATED" || stepStatus == "COMPENSATION_FAILED" {
+		return false, nil
 	}
 
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)

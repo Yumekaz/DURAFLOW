@@ -6,6 +6,8 @@ DuraFlow is a local-first durable workflow engine that runs multi-step backend o
 
 Run `go test ./...` for the unprivileged suite. Real Mini-Docker execution uses dedicated BusyBox rootfs fixtures and requires root, or an explicitly capable rootless host with `DURAFLOW_TEST_MINIDOCKER=1`. A prerequisite skip is not runtime proof. PostgreSQL tests require `DURAFLOW_TEST_POSTGRES_DSN`; the 2026-10-08 Cairn acceptance gate ran them against a private real PostgreSQL container, including concurrent initial lease acquisition, and separately passed the three privileged Mini-Docker executor tests.
 
+The October 14 verification reproduced and repaired stale-scan replay of succeeded steps and duplicate in-flight execution by the same worker after a stale heartbeat. SQLite and PostgreSQL lease claims now preserve terminal steps except for deliberate compensation; workers reserve execution before acquiring a lease. All five real PostgreSQL tests passed locally. CI additionally requires the worker/store race detector. This does not turn external side effects into globally exactly-once operations: commands still need replay-safe design across process loss.
+
 ## One-Line Definition
 
 **DuraFlow is a local-first durable workflow engine that runs multi-step backend operations reliably across crashes, retries, worker failures, timers, idempotency issues, and rollback/compensation needs.**

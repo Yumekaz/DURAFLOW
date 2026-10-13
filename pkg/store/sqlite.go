@@ -576,6 +576,20 @@ func (s *SQLiteStore) AcquireLease(runID, stepID, workerID string, duration time
 	if err != nil && err != sql.ErrNoRows {
 		return false, fmt.Errorf("failed to query step state: %w", err)
 	}
+	// A scan's earlier eligibility view may be stale after an execution
+	// persisted success and released its lease. Never turn that success back
+	// into RUNNING, except for deliberate compensation of the workflow.
+	if stepStatus == "SUCCEEDED" || stepStatus == "COMPENSATING" {
+		var runStatus string
+		if err := tx.QueryRow("SELECT status FROM workflow_runs WHERE run_id = ?", runID).Scan(&runStatus); err != nil {
+			return false, err
+		}
+		if runStatus != "COMPENSATING" {
+			return false, nil
+		}
+	} else if stepStatus == "FAILED" || stepStatus == "SKIPPED" || stepStatus == "COMPENSATED" || stepStatus == "COMPENSATION_FAILED" {
+		return false, nil
+	}
 
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	nextAttempt := attempt

@@ -83,10 +83,14 @@ jobs:
           python3 - <<'PY'
           import json
           rows=[json.loads(line) for line in open('verification/unit.jsonl')]
-          expected={'TestPostgresStore_LifecycleAndOperations','TestPostgresLeaseConcurrentInitialClaim','TestPostgresStore_WorkersAndLeases','TestPostgresTimersAndCronSchedules'}
+          expected={'TestPostgresStore_LifecycleAndOperations','TestPostgresLeaseConcurrentInitialClaim','TestPostgresStore_WorkersAndLeases','TestPostgresTimersAndCronSchedules','TestPostgresLeaseCannotReplaySucceededStep'}
           passed={r.get('Test') for r in rows if r.get('Action')=='pass'}
           assert expected <= passed, f'PostgreSQL tests missing: {expected-passed}'
           PY
+      - name: Worker and store race detector with real PostgreSQL
+        run: |
+          set -o pipefail
+          CGO_ENABLED=1 go test -race ./pkg/worker ./pkg/store -count=1 -timeout 8m -json | tee verification/race.jsonl
       - name: Build CLI
         run: go build ./cmd/duraflow
       - uses: actions/upload-artifact@v4
